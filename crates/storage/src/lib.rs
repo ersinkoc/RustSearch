@@ -125,16 +125,16 @@ pub fn save(path: &Path, index: &Index) -> Result<[u8; 24]> {
     for e in &index.entries {
         writer.write_all(&e.id.to_le_bytes())?;
         writer.write_all(&e.parent.to_le_bytes())?;
-        writer.write_all(&e.usn.to_le_bytes())?;
-        writer.write_all(&e.size.to_le_bytes())?;
+        writer.write_all(&index.usn(e).to_le_bytes())?;
+        writer.write_all(&index.size(e).to_le_bytes())?;
         writer.write_all(&e.name_offset.to_le_bytes())?;
         writer.write_all(&e.key_offset.to_le_bytes())?;
         writer.write_all(&e.name_len.to_le_bytes())?;
-        writer.write_all(&e.flags.to_le_bytes())?;
+        writer.write_all(&index.flags(e).to_le_bytes())?;
         writer.write_all(&e.key_len.to_le_bytes())?;
     }
     let mut chunk = [0u8; 16384];
-    for names in index.names.chunks(chunk.len() / 2) {
+    for names in index.names.decoded_blocks() {
         for (n, unit) in names.iter().enumerate() {
             chunk[n * 2..n * 2 + 2].copy_from_slice(&unit.to_le_bytes());
         }
@@ -368,15 +368,24 @@ fn load_base(path: &Path) -> Result<Index> {
         for bytes in block[..count * 48].chunks_exact(48) {
             let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
             let u32_at = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let flags = u16::from_le_bytes(bytes[42..44].try_into()?);
+            ensure!(
+                flags & !(DIRECTORY | SIZE_KNOWN | REPARSE) == 0,
+                "unknown entry flags"
+            );
+            let (value, flags) = index.store_values(
+                i64::from_le_bytes(bytes[16..24].try_into()?),
+                u64_at(24),
+                flags,
+            );
             let entry = Entry {
                 id: u64_at(0),
                 parent: u64_at(8),
-                usn: i64::from_le_bytes(bytes[16..24].try_into()?),
-                size: u64_at(24),
+                value,
                 name_offset: u32_at(32),
                 key_offset: u32_at(36),
                 name_len: u16::from_le_bytes(bytes[40..42].try_into()?),
-                flags: u16::from_le_bytes(bytes[42..44].try_into()?),
+                flags,
                 key_len: u32_at(44),
             };
             ensure!(
@@ -385,7 +394,7 @@ fn load_base(path: &Path) -> Result<Index> {
             );
             previous = Some(entry.id);
             ensure!(
-                entry.flags & !(DIRECTORY | SIZE_KNOWN | REPARSE) == 0,
+                index.flags(&entry) & !(DIRECTORY | SIZE_KNOWN | REPARSE) == 0,
                 "unknown entry flags"
             );
             ensure!(
@@ -400,20 +409,23 @@ fn load_base(path: &Path) -> Result<Index> {
         }
         remaining -= count as u64;
     }
-    // Small delta batches must not realloc/copy a several-hundred-MiB base name arena.
-    // 192 KiB total headroom is paid once at load, independently of record count.
+    // Compact names append in blocks; reserve directory capacity without a full UTF-16 pool.
+    // The separate key arena below retains 64 KiB of headroom for small delta batches.
     index
         .names
         .try_reserve_exact(usize::try_from(names)?.saturating_add(65_536))?;
+    let mut units = Vec::with_capacity(block.len() / 2);
     let mut remaining = names;
     while remaining > 0 {
         let count = remaining.min((block.len() / 2) as u64) as usize;
         reader.read_exact(&mut block[..count * 2])?;
-        index.names.extend(
+        units.clear();
+        units.extend(
             block[..count * 2]
                 .chunks_exact(2)
                 .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])),
         );
+        index.names.extend_from_slice(&units);
         remaining -= count as u64;
     }
     index
@@ -429,6 +441,36 @@ fn load_base(path: &Path) -> Result<Index> {
 mod tests {
     use super::*;
     use rustsearch_core::{DIRECTORY, Record};
+    #[test]
+    fn compact_memory_roundtrip_keeps_snapshot_bytes_including_unknown_raw_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = dir.path().join("before.rsidx");
+        let after = dir.path().join("after.rsidx");
+        let mut source = fixture();
+        let (value, flags) = source.store_values(i64::MIN, u64::MAX, 0);
+        source.entries[0].value = value;
+        source.entries[0].flags = flags;
+        for id in 3..9000 {
+            source
+                .push(Record {
+                    id,
+                    parent: 1,
+                    usn: i64::MAX,
+                    size: Some(id * 65537),
+                    flags: 0,
+                    name: format!("cross-block-{id}-🙂-Ω").encode_utf16().collect(),
+                })
+                .unwrap();
+        }
+        source.finish().unwrap();
+        save(&before, &source).unwrap();
+        let loaded = load(&before).unwrap();
+        save(&after, &loaded).unwrap();
+        assert_eq!(
+            std::fs::read(before).unwrap(),
+            std::fs::read(after).unwrap()
+        );
+    }
     fn fixture() -> Index {
         let mut index = Index::new(Metadata {
             source: "walk".into(),
@@ -462,12 +504,13 @@ mod tests {
         let mut index = fixture();
         save(&p, &index).unwrap();
         let read = load(&p).unwrap();
-        assert_eq!(read.names, vec![0xd800, 120]);
+        assert_eq!(read.name(&read.entries[0]).as_ref(), &[0xd800, 120]);
         assert_eq!(read.metadata.pending_refresh, vec![9]);
-        assert_eq!(read.entries[0].usn, 42);
-        index.entries[0].size = 1024;
+        assert_eq!(read.usn(&read.entries[0]), 42);
+        index.set_size(0, 1024);
         save(&p, &index).unwrap();
-        assert_eq!(load(&p).unwrap().entries[0].size, 1024);
+        let loaded = load(&p).unwrap();
+        assert_eq!(loaded.size(&loaded.entries[0]), 1024);
         assert!(std::fs::read_dir(d.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -530,8 +573,20 @@ mod tests {
         assert_eq!(actual.keys, expected.keys);
         for (a, b) in actual.entries.iter().zip(&expected.entries) {
             assert_eq!(
-                (a.id, a.parent, a.usn, a.size, a.flags),
-                (b.id, b.parent, b.usn, b.size, b.flags)
+                (
+                    a.id,
+                    a.parent,
+                    actual.usn(a),
+                    actual.size(a),
+                    actual.flags(a)
+                ),
+                (
+                    b.id,
+                    b.parent,
+                    expected.usn(b),
+                    expected.size(b),
+                    expected.flags(b)
+                )
             );
             assert_eq!(actual.name(a), expected.name(b));
             assert_eq!(actual.key(a), expected.key(b));

@@ -56,7 +56,7 @@ impl Query {
                 continue;
             }
             if let Some(size) = self.min_size
-                && (directory || entry.flags & SIZE_KNOWN == 0 || entry.size < size)
+                && (directory || entry.flags & SIZE_KNOWN == 0 || index.size(entry) < size)
             {
                 continue;
             }
@@ -83,7 +83,7 @@ impl Query {
                     continue;
                 }
                 // Reverse size makes the smallest retained file the heap root. ID breaks ties deterministically.
-                let candidate = (std::cmp::Reverse(entry.size), entry.id);
+                let candidate = (std::cmp::Reverse(index.size(entry)), entry.id);
                 if top.len() < self.limit {
                     top.push(candidate);
                 } else if top.peek().is_some_and(|worst| candidate < *worst) {

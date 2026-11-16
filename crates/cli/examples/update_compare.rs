@@ -38,9 +38,9 @@ fn main() -> Result<()> {
             Some(Record {
                 id: e.id,
                 parent: e.parent,
-                usn: e.usn,
-                size: Some(e.size.saturating_add(7)),
-                flags: e.flags,
+                usn: source.usn(e),
+                size: Some(source.size(e).saturating_add(7)),
+                flags: source.flags(e),
                 name: source.name(e).to_vec(),
             }),
         );
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
         .take(128)
     {
         let live = source.get(e.id).unwrap();
-        signature = signature.wrapping_mul(0x100000001b3) ^ live.id ^ live.size;
+        signature = signature.wrapping_mul(0x100000001b3) ^ live.id ^ source.size(live);
     }
     let result = json!({"mode":mode,"scope":"128 identical synthetic metadata edits on a frozen real NTFS snapshot; no filesystem file contents modified","changed_records":128,"result_signature":signature,"wall_update_ms":elapsed_ms,"cpu_update_ms":after.cpu_ms-before.cpu_ms,"private_bytes":after.private_bytes,"peak_private_bytes_process_lifetime":after.peak_private_bytes,"working_set_bytes":after.working_set_bytes,"bytes_persisted":writes,"process_write_transfer_bytes":after.write_transfer_bytes-before.write_transfer_bytes,"setup":"source load and hard-link creation excluded; each mode runs in a separate process"});
     std::fs::write(report, serde_json::to_vec_pretty(&result)?)?;

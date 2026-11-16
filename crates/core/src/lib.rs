@@ -2,6 +2,10 @@ use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod names;
+pub use names::Names;
+const INDIRECT: u16 = 1 << 15;
+
 pub const DIRECTORY: u16 = 1;
 pub const SIZE_KNOWN: u16 = 2;
 pub const REPARSE: u16 = 4;
@@ -31,8 +35,8 @@ pub struct Metadata {
 pub struct Entry {
     pub id: u64,
     pub parent: u64,
-    pub usn: i64,
-    pub size: u64,
+    /// Opaque metadata word; use Index::usn and Index::size.
+    pub value: u64,
     pub name_offset: u32,
     pub key_offset: u32,
     pub name_len: u16,
@@ -62,7 +66,8 @@ pub struct Delta {
 pub struct Index {
     pub metadata: Metadata,
     pub entries: Vec<Entry>,
-    pub names: Vec<u16>,
+    pub names: Names,
+    values: Vec<u8>,
     pub keys: Vec<u8>,
     pub updates: BTreeMap<u64, Option<Entry>>,
     pub log_sequence: u64,
@@ -74,12 +79,39 @@ pub fn search_key(name: &[u16]) -> Vec<u8> {
     String::from_utf16_lossy(name).to_lowercase().into_bytes()
 }
 
+fn encode_value(bytes: &mut Vec<u8>, mut value: u64) {
+    while value >= 128 {
+        bytes.push((value as u8) | 128);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+}
+fn decode_value(bytes: &[u8], at: usize) -> (u64, usize) {
+    try_decode_value(bytes, at).expect("metadata produced by encode_value")
+}
+fn try_decode_value(bytes: &[u8], mut at: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes.get(at)?;
+        at += 1;
+        if shift == 63 && byte > 1 {
+            return None;
+        }
+        value |= ((byte & 127) as u64) << shift;
+        if byte < 128 {
+            return Some((value, at));
+        }
+    }
+    None
+}
+
 impl Index {
     pub fn new(metadata: Metadata) -> Self {
         Self {
             metadata,
             entries: Vec::new(),
-            names: Vec::new(),
+            names: Names::default(),
+            values: Vec::new(),
             keys: Vec::new(),
             updates: BTreeMap::new(),
             log_sequence: 0,
@@ -89,6 +121,10 @@ impl Index {
 
     pub fn push(&mut self, record: Record) -> Result<()> {
         ensure!(!record.name.is_empty(), "empty file name");
+        ensure!(
+            record.flags & !(DIRECTORY | SIZE_KNOWN | REPARSE) == 0,
+            "unknown entry flags"
+        );
         ensure!(
             !record.name.iter().any(|c| matches!(*c, 0 | 47 | 92)),
             "invalid file name separator"
@@ -112,16 +148,17 @@ impl Index {
                 .is_some_and(|n| n <= u32::MAX as usize),
             "key arena exceeds 32-bit offsets"
         );
+        let flags =
+            (record.flags & !SIZE_KNOWN) | if record.size.is_some() { SIZE_KNOWN } else { 0 };
+        let (value, flags) = self.store_values(record.usn, record.size.unwrap_or(0), flags);
         self.entries.push(Entry {
             id: record.id,
             parent: record.parent,
-            usn: record.usn,
-            size: record.size.unwrap_or(0),
+            value,
             name_offset,
             key_offset,
             name_len,
-            flags: (record.flags & !SIZE_KNOWN)
-                | if record.size.is_some() { SIZE_KNOWN } else { 0 },
+            flags,
             key_len,
         });
         self.names.extend_from_slice(&record.name);
@@ -143,9 +180,15 @@ impl Index {
             );
             previous = Some(entry.id);
             ensure!(
-                entry.flags & !(DIRECTORY | SIZE_KNOWN | REPARSE) == 0,
+                entry.flags & !(DIRECTORY | SIZE_KNOWN | REPARSE | INDIRECT) == 0,
                 "unknown entry flags"
             );
+            if entry.flags & INDIRECT != 0 {
+                let valid = try_decode_value(&self.values, entry.value as usize)
+                    .and_then(|(size, next)| (size != 0).then_some(next))
+                    .and_then(|next| try_decode_value(&self.values, next));
+                ensure!(valid.is_some(), "invalid metadata reference");
+            }
             let end = (entry.name_offset as usize).checked_add(entry.name_len as usize);
             ensure!(
                 entry.name_len > 0 && end.is_some_and(|n| n <= self.names.len()),
@@ -160,9 +203,45 @@ impl Index {
         Ok(())
     }
 
-    pub fn name(&self, entry: &Entry) -> &[u16] {
-        &self.names
-            [entry.name_offset as usize..entry.name_offset as usize + entry.name_len as usize]
+    pub fn name(&self, entry: &Entry) -> std::borrow::Cow<'_, [u16]> {
+        self.names
+            .slice(entry.name_offset as usize..entry.name_offset as usize + entry.name_len as usize)
+    }
+    pub fn flags(&self, entry: &Entry) -> u16 {
+        entry.flags & !INDIRECT
+    }
+    pub fn usn(&self, entry: &Entry) -> i64 {
+        if entry.flags & INDIRECT != 0 {
+            let (_, next) = decode_value(&self.values, entry.value as usize);
+            let (usn, _) = decode_value(&self.values, next);
+            ((usn >> 1) as i64) ^ -((usn & 1) as i64)
+        } else {
+            entry.value as i64
+        }
+    }
+    pub fn size(&self, entry: &Entry) -> u64 {
+        if entry.flags & INDIRECT != 0 {
+            decode_value(&self.values, entry.value as usize).0
+        } else {
+            0
+        }
+    }
+    pub fn store_values(&mut self, usn: i64, size: u64, flags: u16) -> (u64, u16) {
+        if size != 0 {
+            let at = self.values.len() as u64;
+            encode_value(&mut self.values, size);
+            encode_value(&mut self.values, ((usn as u64) << 1) ^ ((usn >> 63) as u64));
+            (at, flags | INDIRECT)
+        } else {
+            (usn as u64, flags & !INDIRECT)
+        }
+    }
+    pub fn set_size(&mut self, row: usize, size: u64) {
+        let usn = self.usn(&self.entries[row]);
+        let flags = self.flags(&self.entries[row]) | SIZE_KNOWN;
+        let (value, flags) = self.store_values(usn, size, flags);
+        self.entries[row].value = value;
+        self.entries[row].flags = flags;
     }
 
     pub fn key(&self, entry: &Entry) -> &[u8] {
@@ -240,13 +319,19 @@ impl Index {
             "delta key arena overflow"
         );
         self.names.try_reserve_exact(staged.names.len())?;
+        self.values.try_reserve_exact(staged.values.len())?;
         self.keys.try_reserve_exact(staged.keys.len())?;
-        self.names.extend(staged.names);
+        self.names.append(&staged.names);
+        let value_base = self.values.len() as u64;
+        self.values.extend(staged.values);
         self.keys.extend(staged.keys);
         let mut records = staged.entries.into_iter();
         for (id, record) in delta.records {
             let entry = record.map(|_| {
                 let mut e = records.next().expect("validated staged record");
+                if e.flags & INDIRECT != 0 {
+                    e.value += value_base;
+                }
                 e.name_offset += name_base;
                 e.key_offset += key_base;
                 e
@@ -297,21 +382,22 @@ impl Index {
     pub fn intern_names(&mut self) -> Result<()> {
         let old_names = std::mem::take(&mut self.names);
         let old_keys = std::mem::take(&mut self.keys);
-        let mut names: HashMap<&[u16], u32> = HashMap::new();
+        let mut names: HashMap<Vec<u16>, u32> = HashMap::new();
         let mut keys: HashMap<&[u8], u32> = HashMap::new();
         for entry in self
             .entries
             .iter_mut()
             .chain(self.updates.values_mut().filter_map(Option::as_mut))
         {
-            let name = &old_names
-                [entry.name_offset as usize..entry.name_offset as usize + entry.name_len as usize];
-            entry.name_offset = if let Some(&offset) = names.get(name) {
+            let name = old_names.slice(
+                entry.name_offset as usize..entry.name_offset as usize + entry.name_len as usize,
+            );
+            entry.name_offset = if let Some(&offset) = names.get(name.as_ref()) {
                 offset
             } else {
                 let offset = u32::try_from(self.names.len())?;
-                self.names.extend_from_slice(name);
-                names.insert(name, offset);
+                self.names.extend_from_slice(&name);
+                names.insert(name.into_owned(), offset);
                 offset
             };
             let key = &old_keys
@@ -325,6 +411,21 @@ impl Index {
                 offset
             };
         }
+        let values = std::mem::take(&mut self.values);
+        for entry in self
+            .entries
+            .iter_mut()
+            .chain(self.updates.values_mut().filter_map(Option::as_mut))
+        {
+            if entry.flags & INDIRECT != 0 {
+                let (_, next) = decode_value(&values, entry.value as usize);
+                let (_, end) = decode_value(&values, next);
+                let start = entry.value as usize;
+                entry.value = self.values.len() as u64;
+                self.values.extend_from_slice(&values[start..end]);
+            }
+        }
+        self.values.shrink_to_fit();
         self.names.shrink_to_fit();
         self.keys.shrink_to_fit();
         Ok(())
@@ -354,7 +455,7 @@ impl Index {
             .collect();
         for part in parts.into_iter().rev() {
             path.push(92);
-            path.extend_from_slice(part);
+            path.extend_from_slice(&part);
         }
         Ok(path)
     }
@@ -398,9 +499,9 @@ impl Index {
                 result.push(Record {
                     id: entry.id,
                     parent: entry.parent,
-                    usn: entry.usn,
-                    size: (entry.flags & SIZE_KNOWN != 0).then_some(entry.size),
-                    flags: entry.flags,
+                    usn: self.usn(entry),
+                    size: (entry.flags & SIZE_KNOWN != 0).then_some(self.size(entry)),
+                    flags: self.flags(entry),
                     name: self.name(entry).to_vec(),
                 })?;
             }
@@ -419,7 +520,8 @@ impl Index {
 
     pub fn allocated_bytes(&self) -> usize {
         self.entries.capacity() * std::mem::size_of::<Entry>()
-            + self.names.capacity() * 2
+            + self.names.allocated_bytes()
+            + self.values.capacity()
             + self.keys.capacity()
             + self.updates.len() * (std::mem::size_of::<Entry>() + 48)
     }
@@ -464,6 +566,54 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_metadata_ranges_survive_delta_interning_and_zero_size_changes() {
+        let mut index = fixture();
+        let cases = [
+            (i64::MIN, None),
+            (i64::MAX, Some(u64::MAX)),
+            (-1, Some(0)),
+            (0, Some(128)),
+            (1, Some(1u64 << 63)),
+        ];
+        for (at, (usn, size)) in cases.iter().copied().enumerate() {
+            let mut r = record(at as u64 + 2, 1, "metadata.txt");
+            r.usn = usn;
+            r.size = size;
+            index.push(r).unwrap();
+        }
+        index.finish().unwrap();
+        let mut replacement = record(3, 1, "changed.txt");
+        replacement.usn = i64::MIN;
+        replacement.size = Some(u64::MAX);
+        index
+            .apply_delta(Delta {
+                previous_sequence: 0,
+                previous_checkpoint: None,
+                metadata: index.metadata.clone(),
+                records: BTreeMap::from([(3, Some(replacement))]),
+            })
+            .unwrap();
+        index.intern_names().unwrap();
+        for (at, (usn, size)) in cases.iter().copied().enumerate() {
+            let id = at as u64 + 2;
+            let entry = index.get(id).unwrap();
+            let (usn, size) = if id == 3 {
+                (i64::MIN, Some(u64::MAX))
+            } else {
+                (usn, size)
+            };
+            assert_eq!(index.usn(entry), usn);
+            assert_eq!(index.size(entry), size.unwrap_or(0));
+            assert_eq!(entry.flags & SIZE_KNOWN != 0, size.is_some());
+        }
+        index.consolidate().unwrap();
+        index.set_size(1, 0);
+        assert_eq!(index.usn(&index.entries[1]), i64::MIN);
+        assert_eq!(index.size(&index.entries[1]), 0);
+        assert_ne!(index.entries[1].flags & SIZE_KNOWN, 0);
+        index.validate().unwrap();
+    }
     pub fn fixture() -> Index {
         Index::new(Metadata {
             source: "walk".into(),
@@ -520,7 +670,7 @@ mod tests {
         r.name = vec![0xd800, 120];
         i.push(r).unwrap();
         i.finish().unwrap();
-        assert_eq!(i.name(i.get(2).unwrap()), &[0xd800, 120]);
+        assert_eq!(i.name(i.get(2).unwrap()).as_ref(), &[0xd800, 120]);
         let mut updates = BTreeMap::new();
         updates.insert(2, Some(record(2, 1, "renamed")));
         let updated = i.apply(i.metadata.clone(), updates).unwrap();

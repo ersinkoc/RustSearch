@@ -1,197 +1,112 @@
-# RustSearch — Ürün ve teknik plan
+# Product and technical plan
 
-Tarih: 16 Kasım 2026. Çalışma adı: RustSearch. Durum: A aşaması CLI prototipi uygulandı ve gerçek NTFS diskinde denendi; [sonuçlar](PHASE_A_RESULTS.md), güncel kullanım ve kapsam [CLI.md](CLI.md) içinde. Bu belge hedef mimariyi ve sonraki aşamaları tanımlar.
+Updated 17 November 2026. Version **0.0.1** is a working Windows CLI prototype. This document describes the intended product, not a claim that all planned features exist. See [current CLI coverage](CLI.md) and [measured results](MEMORY_RESULTS.md).
 
-## 1. Ürün tanımı
+## Product scope
 
-Windows üzerinde dosya bulmayı ve disk alanını anlamayı aynı güncel indeksle sağlayan masaüstü uygulaması. Öncelik sırası: doğru sonuç, düşük kaynak tüketimi, algılanan hız ve arayüz sadeliği.
+Build a Windows desktop application that finds files and explains disk usage from the same current metadata index. Priorities: correctness, low resource consumption, perceived speed, and a simple interface.
 
-Kullanıcı kararı: İlk sürüm dosya/klasör adı, yol, uzantı, boyut ve tarih araması ile disk alanı haritasını kapsar. İçerik araması sonraki aşamadır.
+The selected first-release scope is file/folder search and a disk-space map. Content indexing comes later. The product and project documentation are in English.
 
-“Her şeyi bulmak”, ilk sürümde desteklenen ve indekse alınmış disklerdeki mevcut dosya ve klasör metadata'sını bulmak demektir. Silinmiş dosya kurtarma, kilitli BitLocker birimleri, arşiv içi dosyalar, çevrimdışı bulut içeriği ve sanal dosya sistemlerinin içeriği bu kapsama girmez. VHDX, WSL ve arşiv dosyaları dış dosya olarak görünür; içleri açılmaz.
+Finding everything means supported, indexed file/folder metadata. It does not include deleted-file recovery, locked BitLocker volumes, archive contents, offline cloud contents, or arbitrary virtual filesystems. VHDX/WSL/archive containers initially appear as outer files. Target Windows 11 x64 and local NTFS SSD/HDD first; Windows 10, ARM64, ReFS, FAT/exFAT, NAS, and network shares require separate compatibility work.
 
-İlk hedef Windows 11 x64 ve yerel NTFS SSD/HDD. Windows 10, ARM64, ReFS, FAT/exFAT, NAS ve ağ paylaşımları ayrı uyumluluk aşamasında ele alınır. Farklı dosya sistemlerine aynı hız sözü verilmez.
+## User experience
 
-## 2. Kullanıcı deneyimi
+Search should open from a shortcut, accept cancellable queries, and expose name/path/extension/type/volume/size/date filters. Results need virtualization, keyboard access, high-DPI support, and normal-user Shell actions for open/reveal/copy-path. Full count and final sorting may finish after first visible results; partial status must be explicit.
 
-### Arama
-
-- Kısayolla açılan pencere; yazarken iptal edilebilir arama.
-- Dosya adı, tam yol, uzantı, tür, disk, boyut ve değiştirilme tarihi filtreleri.
-- Dosyalar/klasörler, gizli/sistem öğeleri ve büyük dosyalar için görünür filtreler.
-- Sanal sonuç listesi; milyonlarca sonucu arayüz nesnesine dönüştürmeme.
-- Normal kullanıcı yetkisiyle açma, bulunduğu klasörü gösterme ve yol kopyalama.
-- Klavye ile gezinme; yüksek DPI, Türkçe ve İngilizce arayüz.
-- Sıralama ve tam sonuç sayısının ilk sonuçtan ayrı tamamlanabilmesi.
-
-Örnek hedef sözdizimi; Everything ile tam sözdizimi uyumluluğu vaat edilmez:
+Planned query syntax, not current CLI syntax:
 
 ```text
-invoice                         # ad içinde arama
-ext:pdf                         # uzantı filtresi
-size:>1GiB                      # dosya boyutu filtresi
-path:"D:\Projects" ext:rs       # yol + uzantı
-type:folder                     # klasör sonuçları
-modified:>=2026-11-01            # tarih filtresi
+invoice
+ext:pdf
+size:>1GiB
+path:"D:\Projects" ext:rs
+type:folder
+modified:>=2026-11-01
 ```
 
-Tırnaklı ifade, AND, OR ve dışlama anlamları parser sözleşmesinde tanımlanır. Hatalı sorgu sessizce farklı anlama çevrilmez. Varsayılan ad araması büyük/küçük harfe duyarsızdır; Windows dosya adı karşılaştırması ile Türkçe i/İ/ı/I beklentileri için açık testler gerekir. Kayıplı UTF-8 dönüşümü dosya kimliğini belirlemez; özgün UTF-16 ad korunur.
+The parser must define quoting, AND, OR, and exclusion. Invalid queries must not silently change meaning. Unicode case behavior requires explicit tests; lossy display text must not identify file objects.
 
-### Disk alanı
+Disk analysis should link volume/folder navigation, a tree, file list, and treemap. Show totals, child counts, percentages, largest files/folders, and extension breakdowns. Make logical versus allocated space explicit. Display unknown/inaccessible coverage and freshness. Opening the map should reuse metadata rather than trigger another complete scan; missing sizes can finish in the background with visible partial status.
 
-- Disk → klasör → alt klasör gezinmesi; aynı seçim ağaç, dosya listesi ve haritada korunur.
-- Klasör toplamı, alt öğe sayısı, yüzde ve boyuta göre sıralama.
-- Treemap: alanı boyutla orantılı dikdörtgenlerle gösteren disk haritası.
-- En büyük dosyalar, en büyük klasörler ve uzantıya göre dağılım.
-- Mantıksal boyut / diskte kaplanan alan arasında açık seçim.
-- İndeksin kapsadığı alan, erişilemeyen alan ve güncellik durumu görünür.
-- Harita açılınca ikinci bir tam disk taraması yapılmaz; eksik boyut bilgisi arka planda tamamlanır ve kısmi sonuç açıkça işaretlenir.
+Content/OCR/semantic search, duplicate detection, continuous hashing, automatic cleanup, remote search, and Explorer replacement are outside the first-release scope. Initial disk analysis is read-only; destructive file operations are a separate decision.
 
-### İlk sürüm dışı
+## Architecture
 
-Belge/kod içeriği, OCR, anlamsal/AI arama, sürekli hash hesaplama, kopya dosya taraması, otomatik temizlik, Explorer yerine geçme ve uzaktan arama ilk sürüme alınmaz. İlk sürüm disk analizinde salt okunurdur; silme ve taşıma ayrı ürün kararıdır.
-
-## 3. Rekabet ve başarı ölçütü
-
-Everything'in resmî belgeleri gerçek zamanlı metadata indekslerini, isteğe bağlı klasör boyutlarını ve hızlı sıralama indekslerini açıklıyor. Bu özellikler tek başına farklılaşma değildir. [Kaynak](https://www.voidtools.com/support/everything/indexes/)
-
-Farklılaşma hipotezleri:
-
-1. Ortak indeksle arama sonucundan klasörün alan haritasına hızlı geçiş.
-2. Sıkıştırılmış metadata ve ihtiyaca göre ek indekslerle düşük bellek tüketimi.
-3. Büyük sonuç kümelerinde ilk görünür sonuç ve boyut sıralamasında düşük gecikme.
-4. Açık güncellik ve kapsam bilgisiyle güvenilir disk analizi.
-
-Hız hedefi, karşılaştırılabilir büyük indeks sorgularında p95 gecikmeyi en az 2 kat iyileştirmektir; garanti değildir. Kazanç yalnız belirli sorgu sınıflarında varsa iddia o sınıflarla sınırlandırılır. Gecikmeyi iyileştirirken RAM/CPU/I/O artıyorsa sonuç birlikte değerlendirilir.
-
-## 4. Teknik kararlar
-
-| Alan | Başlangıç kararı | Gerekçe / doğrulama |
-| --- | --- | --- |
-| Çekirdek | Rust, stable MSVC toolchain | Veri yerleşimi ve Windows API kontrolü; sürüm uygulamaya başlarken sabitlenir |
-| Windows erişimi | Resmî windows/windows-sys bağlayıcılarından uygun olanı | FFI sınırını dar tut; kullanılan API'leri özellik bazında aç |
-| Arayüz | Win32 sanal ListView + Direct2D harita adayı | Windows odaklı düşük kaynak hedefi; kullanılabilirlik ve bellek prototipiyle kesinleşir |
-| İndeks | Sürüme sahip paketli snapshot + sınırlı değişiklik katmanı | Her kayıtta nesne/ayrı tahsis ve yinelenen tam yol maliyetinden kaçın |
-| Güncelleme | NTFS USN Journal + hedefli metadata yenileme | Boşta periyodik tam taramadan kaçın |
-| Ayarlar | Küçük yerel yapılandırma dosyası | Ana sorgu yoluna genel amaçlı DB zorunluluğu koyma |
-| Kalıcılık | Atomik snapshot yayımı + dayanıklı checkpoint | Çökme sonrası doğrulanmış nesilden devam et |
-
-Alternatif GUI çatıları yalnız yerel arayüz prototipi süre/maliyet açısından başarısızsa aynı bellek ve erişilebilirlik ölçütleriyle değerlendirilir. Rust tek başına düşük RAM garantisi değildir.
-
-### Bileşenler
+| Area | Direction |
+| --- | --- |
+| Core | Rust with a pinned stable MSVC toolchain and compact data structures |
+| Windows APIs | Narrow `windows-sys` FFI boundary with required features only |
+| UI candidate | Win32 virtual ListView and Direct2D map; validate accessibility and memory before committing |
+| Index | Versioned snapshot, shared name/key pools, bounded committed delta layer |
+| Updates | NTFS USN journal plus targeted metadata refresh |
+| Settings | Small local configuration; no general-purpose database required on the hot path |
+| Persistence | Atomic snapshot publication, durable checkpoints, source validation |
 
 ```mermaid
 flowchart TD
-    A[NTFS metadata enumerasyonu] --> C[İndeks oluşturucu]
-    B[USN Journal] --> D[Değişiklik birleştirme ve metadata yenileme]
-    C --> E[Ortak metadata indeksi]
+    A[NTFS metadata enumeration] --> C[Index builder]
+    B[USN journal] --> D[Change coalescing and metadata refresh]
+    C --> E[Shared metadata index]
     D --> E
-    E --> F[Sorgu motoru]
-    E --> G[Klasör toplamları ve büyük dosyalar]
-    F --> H[Yerel Windows arayüzü]
+    E --> F[Query engine]
+    E --> G[Folder totals and largest files]
+    F --> H[Native Windows UI]
     G --> H
-    E --> I[Snapshot ve checkpoint]
+    E --> I[Snapshot and checkpoint]
 ```
 
-Normal kullanıcı süreci çekirdek indeksin tek sahibidir; arayüz bunu kullanır. Ayrı UI/arama süreçlerinde indeks kopyaları oluşturulmaz. Pencere kapandığında render ve ikon/önizleme işleri durur; güncelleme çekirdeği tepside kalabilir.
+A single normal-user core should own the index; avoid copies in separate UI/query processes. Stop rendering and icon/preview work while hidden. A narrow elevated helper may read volume metadata; it must not execute arbitrary client commands or perform Shell actions as administrator. Service installation, autostart, session lifecycle, and IPC permissions require explicit acceptance before deployment.
 
-Ham birim erişimi gereken bölüm dar bir ayrıcalıklı yardımcıdır. Prototipte kullanıcı tarafından başlatılan yükseltilmiş yardımcı kullanılır. Kurulabilir servise geçiş, otomatik başlangıç ve kullanıcı oturumu yaşam döngüsü denendikten sonra kararlaştırılır. Dosya açma ve Shell eylemleri yükseltilmiş yardımcıda yapılmaz.
+## NTFS correctness
 
-## 5. NTFS indeksleme ve doğruluk
+Capture stable volume identity, journal identity, and a starting USN boundary before enumeration. Build the canonical file-reference/name/parent index with `FSCTL_ENUM_USN_DATA`, separately collect absent metadata such as size, replay concurrent changes, and verify the starting boundary still belongs to retained journal history. Native enumeration is not a raw MFT byte dump; USN V2 records do not contain file lengths.
 
-### İlk indeks
+Coalesce changes by complete file reference, including sequence bits. Refresh size on data changes, handle rename/move/delete and parent changes, and avoid double-applying updates. Only advance the durable checkpoint with its committed index state. Journal wrap/recreation, sleep/resume, device removal, and changing mounts need reconciliation. Do not assume close events alone are enough for actively written files.
 
-1. Birimi sürücü harfiyle değil kalıcı birim kimliğiyle tanı; NTFS desteğini kontrol et.
-2. Journal kimliğini ve başlangıç USN sınırını kaydet; başlangıç taraması boyunca olayları kaybetmeyecek şekilde biriktir.
-3. `FSCTL_ENUM_USN_DATA` ile ad/ebeveyn/dosya kimliği tabanını oluştur. Bu API sonucu ham MFT bayt dökümü değildir. [Microsoft](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_enum_usn_data)
-4. Boyut ve diğer eksik alanlar için sınırlandırılmış metadata toplama yap. İsim indeksi hazır olunca aramayı aç; boyut kapsamını ayrıca bildir.
-5. Tarama süresindeki olayları yeniden uygula; dosya kimliği ve güncellik kontrolleriyle eski tarama verisinin yeni olayı ezmesini önle.
-6. Başlangıç sınırının journal içinde kaldığını yeniden doğrula; tam kapsamı ancak uzlaşma tamamlanınca bildir.
+Raw MFT parsing is an optional measured follow-up, with fixup, attribute-list, extension-record, and corruption handling. It is not the default first solution. Cloud content must not be downloaded simply to learn a size.
 
-`USN_RECORD_V2` ad, kimlik, ebeveyn ve değişiklik nedenini taşır; dosya uzunluğu/ayrılmış alan alanlarını içermez. Boyut için yalnız USN enumerasyonuna güvenilemez. [Microsoft yapı tanımı](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-usn_record_v2)
+## Data and query model
 
-Boyut toplama adayları: sınırlı dosya kimliği/handle sorguları ve gelişmiş toplu NTFS metadata okuma. Her dosyada seri handle açmak darboğaz oluşturabilir. Ham MFT ayrıştırması varsayılan ilk çözüm değildir; ihtiyaç ölçülürse ayrı prototipte fixup, attribute-list, ek kayıt ve bozuk kayıt sınırlarıyla değerlendirilir. Toplu API'lerin alan kapsamı ve sürüm desteği kodlama aşamasında doğrulanır.
+The target model is `Volume -> FileObject -> DirectoryEntry`: hard links create multiple names for one object. Name search returns entries; deduplicated physical-space accounting counts objects. The present prototype stores one canonical name, so full link discovery remains future work.
 
-### Sürekli güncelleme
+Keep original UTF-16 names separate from normalized search keys. Reconstruct paths from parents on demand rather than storing every full path. Distinct-name groups support exact/prefix lookup and substring candidate masks; extension and size orderings remain optional measured costs. Return top-k without materializing millions of UI objects. New requests must cancel stale work and bind to a consistent generation. Bound overlays and measure compaction peaks.
 
-- Journal olaylarını dosya kimliği bazında birleştir; veri değişiminde boyutu yeniden sorgula.
-- Yoğun yazılan dosyalarda kapanış olayını bekleyen tek strateji kullanma; sonlu gecikmeli örnekleme uygula ve son güncelleme zamanını göster.
-- Rename/move/delete, hard-link değişimi, kayıp parent ve MFT kayıt numarası yeniden kullanımını işle.
-- Kimlik, birim + tam dosya referansı/sequence bilgisini korur; yalnız MFT sıra numarası değildir.
-- Yinelenen olaylar toplamları iki kez değiştirmemeli. Checkpoint ancak ilişkili indeks güncellemesi dayanıklı olduğunda ilerler.
-- Journal sarılması, silinmesi veya kimlik değişimi fark edilince indeks güncel sayılmaz; ilgili birimi yeniden uzlaştır veya yeniden kur.
-- Disk çıkarılması, uyku/uyanma ve servis kesintisi sonrası journal aralığını yeniden doğrula.
+Memory mapping is an option, not free RAM. Report private, resident, and file-cache effects independently. Any layout change must preserve full IDs, USNs, unknown/zero distinctions, names, ordering, and delta behavior.
 
-Microsoft değişiklik günlüğünü, tam birim taramasına alternatif ve indeks kurtarma mekanizması olarak tanımlar. [Kaynak](https://learn.microsoft.com/en-us/windows/win32/fileio/change-journals)
+## Disk-space semantics
 
-## 6. Ortak veri modeli ve arama
-
-Temel model: `Volume → FileObject → DirectoryEntry`. Hard link nedeniyle bir dosya nesnesinin birden çok adı/ebeveyni olabilir. Arama ad girdilerini döndürür, fiziksel alan hesabı dosya nesnesini kullanır. Enumerasyonun bütün bağlantı adlarını sağladığı varsayılmaz; hard-link keşfi ve USN ile uzlaştırması doğruluk prototipinin parçasıdır.
-
-- Paketli sabit metadata kolonları; adlar ayrı havuzda, kayıtlar offset ile erişilir.
-- Tam yol her kayıtta yinelenmez; ebeveyn bağlantılarından gerektiğinde oluşturulur ve küçük cache ile tutulur.
-- Özgün UTF-16 ad ile arama anahtarı ayrıdır. Arama anahtarının ek bellek maliyeti bütçeye girer.
-- Başlangıç stratejisi: kompakt doğrusal ad taraması + uzantı/boyut filtreleri. Prefix ve substring farklı iş yükleridir.
-- Profil sonucuna göre sıralı prefix indeksi veya seçici n-gram eklenir; bütün adlara koşulsuz ağır trigram indeksi kurulmaz.
-- İlk 100 sonuç için top-k; tam sıralama ve sonuç sayısı gerektiğinde ayrı hesaplanır. Sonuçların eksik/geçici olması görünürdür.
-- Art arda yazılan daraltıcı sorgular önceki aday kümesini kullanabilir; sorgu genişleyince tam aday kaynağına döner.
-- Eski sorgular nesil numarasıyla iptal edilir. Her UI isteği tutarlı bir indeks nesline bağlıdır.
-- Snapshot ve değişiklik katmanı yinelenen/silinmiş sonuçları uzlaştırır; büyüyen delta kontrollü birleştirilir.
-- Memory mapping yalnız bir adaydır; fiziksel bellek/cache maliyetini yok etmez.
-
-## 7. Klasör boyutlarının doğru anlamı
-
-| Ölçü | Üründeki anlamı |
+| Measure | Meaning |
 | --- | --- |
-| Mantıksal boyut | Dosyanın görünen veri uzunluğu |
-| Diskte kaplanan alan | Doğrulanmış allocation/compression bilgisine göre alan; tek dosyayı silince kazanılacak alan değildir |
-| Klasör mantıksal toplamı | Altındaki ad girdilerinin mantıksal toplamı; hard linklerin tekrarı açıkça belirtilir |
-| Tekilleştirilmiş alan | Dosya nesnesi bir kez sayılır; birimler arası kimlikler karıştırılmaz |
-| Bilinmeyen alan | Boyutu toplanmamış veya kapsam dışı öğeler; sıfır kabul edilmez |
+| Logical size | Visible default-stream data length |
+| Allocated space | Verified allocation/compression accounting; not necessarily reclaimable by deleting one path |
+| Folder logical total | Logical lengths of reachable name entries, with hard-link duplication disclosed |
+| Deduplicated space | Count each file object once within its volume identity |
+| Unknown space | Missing or unsupported metadata; never silently treated as zero |
 
-İlk oluşturma ağaç üzerinde aşağıdan yukarı toplama yapar. Tek dosya boyutu değişimi ilgili atalarda delta uygular. Büyük klasör taşınması alt ağacı tekrar taramak yerine mevcut alt ağaç toplamını eski/yeni ata zincirlerine taşır; eşzamanlı işlemler tutarlı nesilde uygulanır.
+Build folder totals bottom-up. Apply a changed file's delta to ancestors; move existing subtree totals between ancestor chains when a large folder moves. Apply concurrent operations within consistent generations.
 
-Hard linklerin alan haritasında tek bir deterministik sahip ad girdisine atanması önerilir; diğer bağlantılar işaretlenir. Böylece ana haritanın toplamı çifte sayılmaz. Seçili klasörün erişebildiği bütün bağlantıların tekilleştirilmiş toplamı farklı bir ölçüdür; bu iki ölçü karıştırılmaz. Son hard link silinmeden alanın serbest kalacağı iddia edilmez. [Microsoft hard links](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions)
+A deterministic owner name can make treemap totals avoid counting hard-linked objects twice; mark other names. A selected folder's reachable deduplicated total is a different measure. Do not promise reclaimed space before the last hard link disappears. Sparse/compressed/resident data, ADS, placeholders, and allocated sizes need separate correctness fixtures. File totals need not equal Windows used-space totals because of system metadata, shadow copies, reserved clusters, or inaccessible objects; show unexplained differences without inventing causes.
 
-Sparse/sıkıştırılmış dosyalar, resident veri, alternatif veri akışları, bulut placeholder'ları ve ayrılmış alan için ayrı doğruluk örnekleri gerekir. Default veri akışı boyutu, bütün akışların toplamı diye sunulmaz. Sparse alanın görünen uzunluktan farklı olabildiği resmî olarak belgelenmiştir. [Microsoft sparse boyutları](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-the-size-of-a-sparse-file)
+## Resource and access controls
 
-Junction/symlink hedefleri varsayılan olarak takip edilmez. MFT/sistem metadata'sı, shadow copy, ayrılmış kümeler ve erişilemeyen nesneler nedeniyle dosya toplamı Windows'un kullanılan disk alanıyla birebir aynı olmayabilir. Haritada açıklanamayan fark ayrı gösterilir; farkın tamamına kesin bir sebep atanmaz. Bulut dosyalarının içeriği boyut öğrenmek için indirilmez.
+Use bounded work queues and backpressure, with separately measured HDD/SSD concurrency. Avoid idle full scans and periodic UI redraws. Request/cache icons only for visible rows; contain third-party Shell extension stalls. Pause or slow background completion on battery power and support volume exclusions.
 
-## 8. Kaynak yönetimi ve yetkiler
+Measure normal operation, mutation bursts, and old/new generation overlap during compaction. Keep metadata and IPC user-scoped. Raw volume metadata may reveal names beyond normal per-file visibility; the prototype is explicitly authorized administrative use with a private index. Do not expose a machine-wide multi-user service until name visibility rules are proven.
 
-- Boşta tam disk taraması ve sabit aralıklı UI yenilemesi yok; journal bekleme ve olayla uyanma.
-- HDD için düşük paralellik; SSD için ölçülmüş, sınırlı işçi sayısı. Disk/CPU bütçesine göre geri basınç.
-- İkonlar görünür satırlar için istenir ve cache boyutu sınırlıdır; üçüncü taraf Shell uzantılarının UI'yi kilitlemesi engellenir.
-- Önizleme ilk sürümde zorunlu değildir. Treemap görünmediğinde çizim döngüsü çalışmaz.
-- Snapshot birleştirmesinde eski + yeni nesil tepe belleği ölçülür; yalnız normal çalışma belleği raporlanmaz.
-- Pil tasarrufunda başlangıç/boyut tamamlama işleri yavaşlatılır; duraklatma ve sürücü hariç tutma sunulur.
-- İndeks ve IPC erişimi kullanıcı SID'siyle sınırlandırılır. Arşiv/dosya içerikleri veya tam yollar tanı loglarına varsayılan olarak yazılmaz.
-- Ham metadata erişimi dosya adlarını normal ACL görünürlüğünden daha geniş açığa çıkarabilir. İlk hızlı prototip yalnız açıkça yetkilendiren yönetici hesabında, kullanıcıya özel indeksle değerlendirilir.
-- Standart kullanıcı modu erişilebilir klasörleri normal API ile tarar; aynı hız/kapsam iddiası taşımaz. Ortak makine servisi üzerinden çok kullanıcılı tam-birim indeksleme, ad görünürlüğü politikası kanıtlanmadan açılmaz.
-- Yükseltilmiş yardımcı yalnız metadata okur; istemciden keyfi yol/komut alıp çalıştırmaz. Servis kurulumu sürüm kapsamına girerse ayrıcalık, IPC ve yaşam döngüsü kabul şartı olur.
+## Delivery stages
 
-## 9. Aşamalı geliştirme
-
-| Aşama | Somut çıktı | Geçiş şartı |
+| Stage | Deliverable | Exit condition |
 | --- | --- | --- |
-| A — Fizibilite | CLI, NTFS ad indeksi, boyut toplama denemesi, kaynak raporu | Gerçek disk ve küçük doğruluk fixture'larında aynı dosya kümesi; darboğazın ölçülmesi |
-| B — Dayanıklı çekirdek | Sorgu parser'ı, snapshot, journal replay, büyük dosya listesi | Çökme/rename/move/delete/journal-gap senaryolarında tutarlı sonuç |
-| C — Disk analizi | Artımlı klasör toplamları, hard-link politikası, treemap veri modeli | Bağımsız hesapla boyut eşleşmesi; eksik kapsamın görünür olması |
-| D — Masaüstü alfa | Yerel UI, kısayol, tepsi, sanal liste, etkileşimli treemap | Klavye/DPI kontrolü; UI dahil gecikme ve kaynak bütçeleri |
-| E — Beta ve dağıtım | Kurulum/güncelleme, ayrıcalıklı yardımcı dağıtımı, uyku/USB senaryoları | Gerçek Windows kabulü ve sürümü kayıtlı rakip karşılaştırmaları |
-| F — Genişleme | Diğer dosya sistemleri, NAS, isteğe bağlı içerik araması | Her modun bağımsız kaynak bütçesi ve görünür kapsamı |
+| A: feasibility | Native CLI, size-probe experiment, resource reports | Real-disk and small-fixture correctness; measured bottlenecks |
+| B: durable core | Parser, snapshot/journal recovery, largest files | Consistent rename/move/delete and gap/recovery cases |
+| C: disk analysis | Incremental totals, hard-link policy, map data | Independent size agreement and visible partial coverage |
+| D: desktop alpha | Native UI, shortcut, tray, virtual results, treemap | Keyboard/DPI checks and UI-inclusive resource/latency budgets |
+| E: beta/distribution | Installer/update/helper lifecycle | Windows acceptance and versioned competitor comparisons |
+| F: expansion | Other filesystems, NAS, optional content search | Separate coverage and resource budget for each mode |
 
-İçerik araması eklendiğinde seçilmiş klasör/türlerde isteğe bağlı ayrı indeks olur. OCR ve anlamsal arama ayrıca değerlendirilir; temel metadata indeksinin zorunlu maliyeti hâline gelmez.
+The CLI has implemented parts of A and B. GUI, parser, full size coverage, allocated-space accuracy, and disk analysis remain unfinished. Content search should use a separate opt-in index for selected folders/types; OCR/semantic search must not become a mandatory metadata cost. Estimate delivery dates after size-collection and UI feasibility are measured.
 
-Takvim, A aşamasındaki NTFS boyut toplama ve arayüz fizibilitesi sonuçlarından sonra tahmin edilir. Gün verilmiş hız/teslim vaatleri bu aşamada güvenilir değildir.
+The competitive hypothesis is faster transitions between search and disk analysis with compact metadata, selective helpers, and clear freshness. A 2x p95 improvement in comparable large-index query classes is an engineering aim, not a guarantee. Do not omit slower query classes or ignore CPU/RAM/I/O tradeoffs. See the [benchmark protocol](BENCHMARKS.md).
 
-## 10. İlk geliştirme iş paketi
-
-1. Gerçek donanım, dosya sayısı ve Everything yapılandırmasını kaydet.
-2. Rust workspace: `core`, `windows-indexer`, `query`, `storage`, `cli`; UI daha sonra.
-3. İzinli tek NTFS biriminde ad indeksini oluştur; boyut toplama maliyetini ayrı raporla.
-4. USN checkpoint/replay ve küçük fixture doğrulamasını tamamla.
-5. Tam ad/prefix/substring, boyut filtresi ve büyük dosya sorgularını ölç.
-6. Bellek yerleşimini ve hız stratejisini veriye göre seç; ardından masaüstü uygulamasına geç.
-
-Bu belge hedef iş paketini tanımlar; bütün bileşenlerin tamamlandığını göstermez. A aşamasındaki mevcut komutlar ve sınırlar [CLI.md](CLI.md), performans kapıları [BENCHMARKS.md](BENCHMARKS.md) içindedir.
+References consulted for the plan: [Everything indexes](https://www.voidtools.com/support/everything/indexes/), [NTFS enumeration](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_enum_usn_data), [USN V2](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-usn_record_v2), [journals](https://learn.microsoft.com/en-us/windows/win32/fileio/change-journals), [hard links](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions), [sparse sizes](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-the-size-of-a-sparse-file).

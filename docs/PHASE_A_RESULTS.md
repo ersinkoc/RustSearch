@@ -1,112 +1,61 @@
-# A aşaması — Gerçek disk fizibilite sonucu
+# Phase A: real-disk feasibility — 16 November 2026
 
-16 Kasım 2026. Durum: çalışan Windows CLI prototipi, gerçek NTFS biriminde kabul testi geçti. Bu sonuç, Everything'den daha hızlı bir ürün elde edildiği anlamına gelmez.
+These are historical development measurements, not current performance promises. Earlier 0.2/0.3/0.4 labels identify unpublished experiment binaries; the project version is 0.0.1. The current memory comparison is in [MEMORY_RESULTS.md](MEMORY_RESULTS.md). Raw local evidence under `.temp_files` is excluded from the public repository.
 
-## Test edilen ortam ve kapsam
+Environment: Windows 11 Pro build 26300, AMD Ryzen 9 9950X3D, Samsung SSD 990 EVO Plus 4 TB NVMe on D: NTFS, approximately 126 GiB visible RAM, Rust 1.93/MSVC release. OS cache was not flushed; these are not controlled cold-SSD results.
 
-- Windows 11 Pro, build 26300; AMD Ryzen 9 9950X3D; yaklaşık 126 GiB işletim sistemine görünür RAM.
-- D: — Samsung SSD 990 EVO Plus 4TB, NVMe, NTFS.
-- Rust/Cargo 1.93.0; release derlemesi, MSVC, kilitli Cargo bağımlılıkları.
-- İndeksleme sonunda 12.285.944 canonical dosya/klasör kaydı; ayrı journal refresh sonrasında 12.285.803 kayıt. Disk aktifti; sayı farkı beklenen canlı değişikliklerden kaynaklanır.
-- Native backend bir dosya referansına bir canonical ad tutuyor. Bütün hard-link adlarının kapsamı henüz yok.
-- Boyut toplama 5000 uygun dosya denemesiyle sınırlandı; 4999'u başarılıydı. Journal refresh sonrasında boyutu bilinen dosya sayısı 5499 oldu. Diskin tamamının boyutu indekslenmedi.
+## Scope
 
-Kabul ve benchmark binary SHA256:
+Native indexing produced 12,285,944 canonical file/folder records, followed by 12,285,803 after journal refresh. The disk was active. One canonical name per file reference was stored; full hard-link coverage was not established. Of 5000 eligible size probes, 4999 succeeded; refresh raised known-size coverage to 5499 files. This was not a complete disk-size index.
 
-```text
-3774F647E8663C76CB069E7433F147BC2E7CFABE659A723C739F9CF2E518D33A
-```
+## Indexing and resources
 
-Kaynak dosyalarının SHA256 listesi run klasöründeki `source-manifest.json` içindedir. Başlangıçta Git deposu yoktu; commit oluşturulmadı.
-
-## İndeksleme ve kaynaklar
-
-| Ölçüm | Gözlenen |
+| Measurement | Observed |
 | --- | --- |
-| Native ad enumerasyonu + sıralama/doğrulama | 25,686 saniye |
-| 5000 boyut denemesi | 116,445 ms; 1 başarısız |
-| Başlangıç journal replay + yeniden paketleme | 3,912 saniye |
-| İndeks komutunun toplam wall süresi | 31,868 saniye |
-| İndeks komutunun CPU zamanı | 30,563 saniye; yaklaşık bir çekirdek |
-| Başlangıç replay sırasında journal olayları | 14.561 |
-| Normal private commit, indeks oluşturma sonunda | 1,287 GiB |
-| İndeks oluşturma tepe private commit | 3,073 GiB |
-| İndeks oluşturma tepe working set | 2,573 GiB |
-| Yeniden yüklenmiş indekste private commit | 1,286 GiB |
-| Yeniden yüklenmiş indekste working set | 1,289 GiB |
-| Son indeks arena payload'ı | 1.377.352.612 byte; yaklaşık 112 byte/kayıt |
-| Ayrı refresh komutunun toplam süresi | 8,831 saniye |
-| Refresh tepe private commit | 2,572 GiB |
-| Snapshot yükleme, checksum ve doğrulama | 2,735 saniye |
+| Native name enumeration, sort, validation | 25.686 s |
+| 5000 size probes | 116.445 ms; 1 failed |
+| Initial journal replay and repacking | 3.912 s |
+| Total index command wall time | 31.868 s |
+| Index command CPU time | 30.563 s; about one core |
+| Initial replay journal events | 14,561 |
+| Private commit after indexing | 1.287 GiB |
+| Indexing peak private commit | 3.073 GiB |
+| Indexing peak working set | 2.573 GiB |
+| Reloaded private commit | 1.286 GiB |
+| Reloaded working set | 1.289 GiB |
+| Final arena payload | 1,377,352,612 byte; about 112 bytes/record |
+| Separate refresh command wall time | 8.831 s |
+| Refresh peak private commit | 2.572 GiB |
+| Snapshot load, checksum, validation | 2.735 s |
 
-Refresh sırasında iki neslin bellekte tutulması ve bütün snapshot'ın yeniden yazılması hâlâ yüksek bir tepe maliyeti oluşturuyor. CLI her ayrı `search` komutunda snapshot yüklediği için kullanıcıya görünen tek komut süresi yalnız aşağıdaki motor sorgu süresi değildir.
+## Warm linear queries
 
-10 saniyelik **yüklenmiş ama işlem yapmayan CLI** deneyinde process CPU artışı 0 ms ve transfer sayacı artışı 0 byte ölçüldü. Bu kısa, kaba çözünürlüklü deney; bir USN daemon'unun veya 10 dakikalık nihai boşta tüketim hedefinin doğrulaması değildir.
+Five warmups and 100 measured queries per group, full count and at most 100 results. Loading, path display, and UI were excluded. p95 is preliminary; no p99 was claimed.
 
-I/O değerleri process transfer sayaçlarıdır; metadata IOCTL trafiği `other_transfer_bytes` altında raporlanır. Fiziksel disk trafiği, cache soğukluğu ve enerji tüketimi ölçülmedi.
-
-## Sıcak arama gecikmeleri
-
-Her grupta 5 warm-up ardından 100 örnek. Ölçüm tam eşleşme sayımı + en çok 100 sonuç seçimini içerir; path çözümleme, snapshot yükleme ve UI içermez. OS cache kontrol edilmedi. 100 örnekli p95 ön bulgudur; p99 için örnek sayısı yetersiz olduğundan raporlanmadı.
-
-| Sorgu grubu | p50 | p95 |
+| Query group | p50 | p95 |
 | --- | --- | --- |
-| Nadir substring | 148,675 ms | 161,547 ms |
-| Yaygın substring | 174,958 ms | 184,508 ms |
-| Eşleşmeyen substring | 85,255 ms | 98,486 ms |
-| Prefix | 48,406 ms | 57,436 ms |
-| Tam dosya adı | 51,903 ms | 64,534 ms |
-| Uzantı | 61,591 ms | 68,271 ms |
-| Büyük dosya filtresi | 20,060 ms | 27,228 ms |
-| Largest top-100 | 22,704 ms | 29,888 ms |
-| Bütün kayıtlar | 41,559 ms | 50,303 ms |
+| Rare substring | 148.675 ms | 161.547 ms |
+| Common substring | 174.958 ms | 184.508 ms |
+| No-match substring | 85.255 ms | 98.486 ms |
+| Prefix | 48.406 ms | 57.436 ms |
+| Exact name | 51.903 ms | 64.534 ms |
+| Extension | 61.591 ms | 68.271 ms |
+| Large-file filter | 20.060 ms | 27.228 ms |
+| Largest top-100 | 22.704 ms | 29.888 ms |
+| All records | 41.559 ms | 50.303 ms |
 
-Büyük dosya ve largest sonuçları **yalnız boyutu bilinen 5499 dosyada** anlamlıdır; filtre sırasında bütün kayıtlar dolaşılmıştır. Bunlar diskteki bütün büyük dosyaları bulma performansı olarak sunulamaz.
+Large-file results only cover the 5499 known-size files, although the linear implementation scanned all records. These numbers do not demonstrate the one-million-entry target or competitive superiority.
 
-Doğrusal tarama bu ölçekte belirgin darboğazdır. 1 milyon kayıt için planlanan p95 ≤10 ms hedefi ayrı referans fixture'da denenmedi; 12,3 milyonluk sonuç o hedefe doğrudan eşitlenmez. Everything için eşdeğer kapsamlı sorgu benchmark'ı yapılmadı; üstünlük iddiası yoktur.
+## Verification and issues found
 
-## Doğrulama
+Format, warnings-as-errors Clippy, 18 tests, release build, and real NTFS fixture acceptance passed. Rename/move/resize/create/delete, Unicode, and zero-size paths matched independent directory enumeration. Pending refresh was zero. A real junction-cycle test confirmed no reparse traversal. Snapshot DACL inheritance was disabled and limited to the current user, SYSTEM, and Administrators.
 
-- `cargo fmt --all --check` — geçti.
-- `cargo clippy --workspace --all-targets --locked -- -D warnings` — geçti.
-- `cargo test --workspace --locked` — **18 test geçti**, başarısız/ignored test yok. Doc-test blokları 0 test içeriyor; bu sayı test kapsamına eklenmedi.
-- `cargo build --release --locked` — geçti.
-- Native gerçek disk kabul script'i — geçti. Başlangıçta 3 fixture dosyası, ardından rename, move, resize, create, delete, Unicode ve sıfır boyut kontrolleri bağımsız klasör enumerasyonuyla doğrulandı.
-- Son replay'de bekleyen metadata yenilemesi: 0; refresh hata dağılımı boş.
-- Gerçek junction döngüsünde normal klasör taraması hedefi izlemedi.
-- Snapshot'ın DACL kalıtımı kapalı ve mevcut kullanıcı/SYSTEM/Administrators izinleri incelemeyle doğrulandı.
-- Checksum hasarı, kesilmiş/uydurulmuş snapshot uzunlukları, hatalı boyut argümanı, olmayan indeks ve raporun snapshot üzerine yazılmasını reddetme yolları test edildi.
+Two measured defects were fixed: a current-USN request needed Windows-compatible four-byte alignment (the failing live test returned OS error 1784), and one extra inserted record could double arena capacity during repacking. The latter regression initially allocated 150,000 bytes for 75,075 bytes of payload; reservation accounting fixed it. A live-disk observation reduced arena allocation from 2.56 GiB to 1.28 GiB, but its differing live records do not establish indexing speed improvement.
 
-Fixture, bütün diskteki 12 milyon kaydın her birinin bağımsız oracle ile doğrulandığı anlamına gelmez. Gerçek journal silme/sarma, fiziksel disk çıkarma, uyku/uyanma ve süreç keserek çökme kabulü çalıştırılmadı. Servis, GUI, FAT/ReFS/NAS, allocation/ADS boyutları ve bütün hard-link adları henüz yoktur.
+The fixture does not independently validate all disk records. Real journal destruction/wrap, device removal, sleep/resume, process-kill recovery, long-running service, other filesystems, GUI, allocated/ADS sizes, and all hard-link names were not tested/implemented.
 
-## Bu turda ölçümle bulunan ve düzeltilen iki sorun
+Local evidence: [native index](../.temp_files/ntfs-verified-1794855229047/index.json), [refresh](../.temp_files/ntfs-verified-1794855229047/refresh.json), [acceptance](../.temp_files/ntfs-verified-1794855229047/acceptance.json), [warm queries](../.temp_files/ntfs-verified-1794855229047/bench.json), [idle](../.temp_files/ntfs-verified-1794855229047/idle.json). Earlier failed/intermediate logs were retained locally; redundant large snapshots were removed.
 
-1. Dosyanın güncel USN kaydını okuyan isteğin hizalaması: Windows 4 byte hizalama beklerken Rust yapısının doğal hizalaması 2 idi. Gerçek dosya regresyon testi önce OS error 1784 ile başarısız oldu; hizalanmış istek ve output buffer ile geçti. Tam birim kabul testi de aynı rename/move/boyut kontrolleriyle tekrar geçti.
-2. Snapshot yeniden paketlemede kapasite: eski uzunluğa reserve yapıp bir yeni kayıt eklemek, büyük arenaları iki katına çıkarıyordu. Küçük regresyon önce 75.075 byte payload için 150.000 byte tahsisle başarısız oldu; değişiklikler dahil ön hesaplamayla geçti. Yaklaşık 12,3 milyon kayıtlık gerçek koşulda arena tahsisi 2,56 GiB'den 1,28 GiB'ye indi. Karşılaştırma iki canlı disk gözlemi arasındadır; kayıt sayıları küçük miktarda farklıdır. Bu bellek sonucu indeksleme hızlanması iddiası değildir.
+Retained binary SHA256 identities, in historical report order:
 
-## Sonraki teknik öncelikler
-
-1. Tam ad/prefix için kompakt sıralı ad indeksi; substring için seçici aday daraltma. Bellek bütçesini koruyarak mevcut doğrusal tarama baseline'ına karşı karşılaştırma.
-2. Değişiklik katmanı ve aşamalı snapshot yazımı: her refresh'te 1,28 GiB yeniden paketleme/yazmayı ve iki nesil tepesini kaldırma.
-3. Boyut toplamayı tüm dosyalara genişletme; hard-link ad keşfi, allocation/sparse/compression/ADS doğruluğu. Alan haritası bundan sonra.
-4. 1 milyon kayıt referans profili, en az 1000 sorgu örneği, kontrol edilmiş başlangıç deneyleri ve Everything ile aynı kapsamlı karşılaştırma.
-
-## Yerel kanıtlar ve çalıştırma
-
-Son doğrulanmış koşu: [run klasörü](../.temp_files/ntfs-verified-1794855229047/).
-
-- [Native indeksleme raporu](../.temp_files/ntfs-verified-1794855229047/index.json)
-- [Journal refresh raporu](../.temp_files/ntfs-verified-1794855229047/refresh.json)
-- [Kabul sonucu](../.temp_files/ntfs-verified-1794855229047/acceptance.json)
-- [Sıcak arama raporu](../.temp_files/ntfs-verified-1794855229047/bench.json)
-- [Boşta CLI ölçümü](../.temp_files/ntfs-verified-1794855229047/idle.json)
-
-```powershell
-# Son snapshot üzerinde arama; yönetici yetkisi gerekmez.
-.\target\release\rustsearch.exe search --index .temp_files\ntfs-verified-1794855229047\native.rsidx --query RustSearch --limit 20
-
-# Tam kabulü yeni izole fixture ile yeniden çalıştırma: yönetici PowerShell.
-.\scripts\ntfs-acceptance.ps1 -Volume D:
-```
-
-İlk başarısız ve ara koşuların JSON/log kanıtları `.temp_files/ntfs-1794854602545` ve `.temp_files/ntfs-final-1794854966615` altında kaldı. Yer kaplayan eski tam birim snapshot'ları kaldırıldı; son doğrulanmış snapshot korundu. `.temp_files` ve indeks dosyaları `.gitignore` kapsamındadır; yerel rapor bağlantıları depoya taşınacak kanıt yerine geçmez.
+- `3774F647E8663C76CB069E7433F147BC2E7CFABE659A723C739F9CF2E518D33A`

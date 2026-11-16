@@ -455,7 +455,7 @@ fn run() -> Result<()> {
             let query_ms = begin.elapsed().as_secs_f64() * 1000.;
             let rows:Vec<Value>=matches.rows.iter().map(|&row| {
                 let entry=index.get(row).expect("query returned live ID");let path=index.path_utf16(entry);
-                json!({"id":entry.id,"name":String::from_utf16_lossy(index.name(entry)),"path":path.as_ref().ok().map(|p|String::from_utf16_lossy(p)),"path_error":path.as_ref().err().map(ToString::to_string),"display_is_lossy":String::from_utf16(index.name(entry)).is_err(),"pending_refresh":index.metadata.pending_refresh.binary_search(&entry.id).is_ok(),"kind":if entry.flags&DIRECTORY!=0 {"folder"} else {"file"},"logical_size":if entry.flags&SIZE_KNOWN!=0 {Some(entry.size)} else {None}})
+                json!({"id":entry.id,"name":String::from_utf16_lossy(&index.name(entry)),"path":path.as_ref().ok().map(|p|String::from_utf16_lossy(p)),"path_error":path.as_ref().err().map(ToString::to_string),"display_is_lossy":String::from_utf16(&index.name(entry)).is_err(),"pending_refresh":index.metadata.pending_refresh.binary_search(&entry.id).is_ok(),"kind":if entry.flags&DIRECTORY!=0 {"folder"} else {"file"},"logical_size":if entry.flags&SIZE_KNOWN!=0 {Some(index.size(entry))} else {None}})
             }).collect();
             if as_json {
                 emit(

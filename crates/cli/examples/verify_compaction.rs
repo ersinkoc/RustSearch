@@ -17,8 +17,8 @@ fn main() -> Result<()> {
     );
     for (old, new) in a.entries.iter().zip(&b.entries) {
         ensure!(
-            (old.id, old.parent, old.usn, old.size, old.flags)
-                == (new.id, new.parent, new.usn, new.size, new.flags),
+            (old.id, old.parent, a.usn(old), a.size(old), a.flags(old))
+                == (new.id, new.parent, b.usn(new), b.size(new), b.flags(new)),
             "record metadata differs"
         );
         ensure!(

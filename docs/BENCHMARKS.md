@@ -1,100 +1,55 @@
-# RustSearch — Performans ve doğrulama protokolü
+# Performance and correctness protocol
 
-Durum: ölçüm planı. Aşağıdaki sayılar mühendislik hedefidir; gerçekleşmiş sonuç değildir.
+These are engineering targets, not measured achievements. Historical and current observations are in the linked result reports; the first real-disk run is [Phase A](PHASE_A_RESULTS.md).
 
-İlk gerçek disk ölçümleri ayrı [A aşaması sonuç raporunda](PHASE_A_RESULTS.md) yer alır. Hedef tablosu gözlenen sonuçlarla karıştırılmamalıdır.
+## Comparable scope first
 
-## 1. Başarı tanımı
+Correct results precede speed. Fewer indexed files, skipped results, different matching/order, or stale metadata do not count as performance wins. Compare Everything on the same device, volume, user visibility, corpus, freshness, and equivalent metadata/sort options. Record the tested version/channel/settings; do not combine stable and preview channels. For disk analysis, record WizTree's version, privilege, logical/allocated choice, and hard-link policy separately; see its [guide](https://diskanalyzer.com/guide).
 
-Önce aynı kapsamda doğru sonuç, sonra hız ve kaynak tüketimi. Eksik indeks, atlanan dosyalar, farklı arama anlamı veya gecikmiş güncelleme performans kazancı sayılmaz.
+## Initial targets
 
-Everything karşılaştırması aynı cihaz, aynı disk, aynı kullanıcı görünürlüğü, aynı dosya kümesi ve eşdeğer metadata/sıralama seçenekleriyle yapılır. Test günündeki kararlı sürüm ile mevcutsa ayrı 1.5 kanalı, sürüm ve kanal açıkça kaydedilerek ayrı raporlanır. Aralarında sonuç birleştirilmez.
+Reference: Windows 11 x64, 16 GiB RAM, NVMe, one million file/folder name entries. Initial modeling assumes 24 UTF-16 units per name and approximately 10% directories. Record actual distributions, hard links, and index options; different profiles are separate results.
 
-Disk analizi için WizTree ayrı referanstır; adı, sürümü, ayrıcalığı, mantıksal/ayrılmış alan seçimi ve hard-link politikası kaydedilir. WizTree'nin export belgeleri hard linkler için farklı alan raporlamasını açıklıyor. [Resmî kılavuz](https://diskanalyzer.com/guide)
-
-## 2. Başlangıç hedefleri
-
-Referans profil: Windows 11 x64, 16 GiB RAM, NVMe, 1 milyon dosya/klasör adı girdisi; başlangıçta ortalama 24 UTF-16 kod birimi ad ve yaklaşık %10 klasör varsayımı. Gerçek ad uzunluğu dağılımı, hard-link sayısı ve indeks seçenekleri raporda bulunur. Donanım ve profil değişirse sonuçlar ayrı tutulur.
-
-| Metrik | İlk hedef | Ölçüm sınırı |
+| Metric | Initial target | Boundary |
 | --- | --- | --- |
-| Sıcak sorgu, ilk 100 sonuç | p95 ≤ 10 ms | Çekirdek API; aynı sorgu anlamı ve sıralama |
-| Yazımdan görünür sonuçlara | p95 ≤ 50 ms | UI kuyruğu ve çizim dahil; debounce dahil |
-| Büyük dosya ilk 100 | p95 ≤ 20 ms | Boyut indeksi hazır, sıralama eşdeğer |
-| Hazır klasör toplamına erişim | p95 ≤ 5 ms | Veri erişimi; bütün harita çizimi değil |
-| Hazır indeksten pencere açılışı | p95 ≤ 300 ms | Çekirdek çalışırken kısayoldan ilk kullanılabilir kareye |
-| Journal güncelleme gecikmesi | p95 ≤ 500 ms | Sonlu mutasyon/kapanıştan sorguda görünmeye; aktif yazmalar ayrıca |
-| Boşta CPU | Tek çekirdeğin ortalama <%0,1'i | 10 dakika durağan disk, bütün RustSearch süreçleri |
-| Toplam private commit | ≤ 200 MiB | 1 milyon girdide UI + çekirdek + yardımcı, normal çalışma |
-| Toplam resident bellek | ≤ 300 MiB | Shared mapping iki kez sayılmadan; ölçüm yöntemi belirtilir |
-| İsim indeksinin ilk kurulumu | ≤ 15 saniye fizibilite hedefi | Tanımlı NVMe fixture; boyut indeksleme süresi ayrı |
+| Warm query, first 100 results | p95 <=10 ms | Core API, equivalent matching and ordering |
+| Keystroke to visible results | p95 <=50 ms | Includes debounce, UI queue, rendering |
+| Largest-file top 100 | p95 <=20 ms | Size index ready; equivalent ordering |
+| Access prepared folder total | p95 <=5 ms | Data lookup, not entire map rendering |
+| Open window with running core | p95 <=300 ms | Shortcut to first usable frame |
+| Journal update lag | p95 <=500 ms | Finite mutation/close to searchable state; active writes separate |
+| Idle CPU | <0.1% of one core on average | Ten minutes, quiet disk, all product processes |
+| Total private commit | <=200 MiB | One million entries, UI/core/helper in normal use |
+| Total resident memory | <=300 MiB | Disclose method; shared mappings counted once |
+| Initial name indexing | <=15 s feasibility target | Defined NVMe fixture; size collection separate |
 
-Bellek için aday dağılım: çekirdek/indeks 140 MiB, görünür UI 40 MiB, yardımcı 20 MiB. Bu dağılım tasarım bütçesidir. Ad havuzu, arama anahtarları ve ek indeksler bu bütçeye dahildir. Büyük fixture'larda girdi başına byte ve toplam kullanım raporlanır; 1 milyon hedefine uymak daha büyük ölçek başarısını kanıtlamaz.
+Candidate memory budget: core/index 140 MiB, visible UI 40 MiB, helper 20 MiB, including names, keys, and search helpers. Report bytes per entry and total use on larger fixtures. Meeting a design budget alone does not prove lower consumption than Everything.
 
-“Daha az kaynak” iddiası yalnız Everything'in eşdeğer kapsamındaki gerçek ölçümüyle karşılaştırıldıktan sonra kullanılabilir. Hedef bütçeyi tutturmak tek başına rakipten daha düşük tüketim demek değildir.
+## Separate measurements
 
-## 3. Ayrı ölçülecek işler
+Record first name-index readiness; complete size coverage and folder-total readiness; stopped-core load plus journal catch-up; running-core UI open; core query versus visible UI latency; first results versus exact count/final sort; normal memory versus mutation/compaction peaks; CPU time, transfers, persistent bytes, and update backlog.
 
-- İlk isim indeksi süresi ve hazır olan kayıt kapsamı.
-- İlk tam boyut indeksi ve klasör toplamlarının hazır olma süresi.
-- Çekirdek kapalıyken snapshot yükleme + journal yakalama.
-- Çekirdek açıkken UI açılışı.
-- Çekirdek sorgu gecikmesi ve görünür UI gecikmesi.
-- İlk sonuç, kesin toplam sonuç sayısı ve tam sıralamanın bitişi.
-- İndeks normal çalışması, olay fırtınası ve snapshot birleştirmesi sırasındaki tepe bellek.
-- Toplam CPU zamanı, disk okuma/yazma byte'ları, indeks dosya boyutu ve güncelleme borcu.
+Private commit, working set, and file-backed cache are different. A memory-mapped index is not free because its private counter is low. Preserve every relevant metadata field in layout comparisons.
 
-İndeks için kaydedilmiş skor, sorgu için kaydedilmiş skor yerine kullanılamaz. Private commit, working set ve file-backed cache ayrı raporlanır; memory-mapped indeks düşük private değer gösteriyor diye bedelsiz kabul edilmez.
+Use deterministic synthetic corpora at 100k, one million, and ten million entries plus an authorized real disk. Record seed and fixture version. NVMe, SATA SSD, and HDD are separate profiles; unavailable hardware is untested.
 
-## 4. Veri kümeleri ve sorgular
+Query groups should include exact, rare/common/no-match substring, one/two-character and empty queries, prefix, path/multi-term filters, extension/size/date intersections, largest/top-100, folder/tree/map navigation, Unicode case/combining characters/emoji, long paths, and concurrent mutations. Future query classes are not current CLI capabilities. Define expected IDs and tie-breaking for every implemented group.
 
-En az 100 bin, 1 milyon ve 10 milyon girdilik sentetik veri; ayrıca izinli gerçek çalışma diski. Sentetik veride sabit seed ve fixture sürümü bulunur. NVMe, SATA SSD ve HDD ayrı raporlanır; donanım erişilemiyorsa o profil denenmemiş sayılır.
+## Repetition and reporting
 
-Sorgu grupları:
+- Use release builds; record toolchain, source identity, OS, CPU, RAM, disk, power/security settings.
+- Run competitors sequentially, vary order, and verify equal index scope.
+- Target at least 1000 measured warm samples per query group, with warmup separate. Preliminary 100-sample runs may report p95; fewer than 1000 must not claim p99.
+- Target at least ten startup/index repetitions. Smaller development runs must state the actual count and give median/min/max without unsupported tail percentiles.
+- Process restart does not establish cold storage. Label uncontrolled OS cache explicitly.
+- Do not apply a security/Defender exception to only one competitor. Record throttling and power mode.
+- Compare query engines through CLI/SDK when possible; UI end-to-end tests remain separate.
+- Retain machine-readable results, commands, hashes, and coverage. Current runners are `benchmark-startup.ps1`, `benchmark-hot.ps1`, and CLI `bench`; they do not implement all planned profiles.
 
-1. Tam ad, nadir substring, yaygın substring ve eşleşmeyen ad.
-2. Bir/iki karakterlik çok geniş sorgular ve boş sorgu.
-3. Prefix, birden fazla terim ve yol filtresi.
-4. Uzantı + boyut + tarih kesişimi.
-5. Tüm dosyaları boyuta göre sıralama ve top-100.
-6. Klasör seçimi, en büyük alt klasörler ve treemap drill-down.
-7. Türkçe i/İ/ı/I, emoji, birleşik Unicode ve uzun yollar.
-8. Arama yazılırken yoğun dosya oluşturma/silme/taşıma.
+## Correctness acceptance matrix
 
-Her sorgu için beklenen sonuç kimlikleri ve sıralama/tie-break sözleşmesi bulunur. İlk 100 sonucu gösteren uygulama bütün sonuçları tamamlayan uygulamayla aynı metrik altında karşılaştırılmaz. Fuzzy/regex ilk kapının zorunlu özelliği değildir.
+Cover create/grow/shrink/delete, writes to open files, file/folder rename/move, parent ordering, hard-link creation/removal, sparse/compressed/resident/alternate-stream data, junction/symlink cycles, permission changes, cloud placeholders without content hydration, concurrent enumeration, journal gaps/recreation, sleep/resume, mount/device changes, interruption around checkpoints, reused file references, and corrupt/truncated snapshots.
 
-## 5. Tekrar ve raporlama
+Use independent Win32 enumeration and metadata probes on controlled fixtures; a competitor is not the sole oracle. An active volume is not an atomic snapshot. Check correctness at a quiet fixture or defined mutation barrier.
 
-- Release derlemesi; toolchain, commit, OS build, CPU, RAM, disk ve güvenlik yazılımı durumu kaydedilir.
-- Yarışmacılar aynı anda çalıştırılmaz; koşu sırası değiştirilir ve indeks kapsamları doğrulanır.
-- Warm sorgularda grup başına en az 1.000 örnek; warm-up örnekleri ayrı tutulur. 30 örnekle p99 iddiası kurulmaz.
-- Başlangıç/indeksleme deneylerinde en az 10 tekrar; medyan, min/max ve örnek sayısı raporlanır. p95/p99 için yetersiz örnek açıkça belirtilir.
-- OS cache soğukluğu yalnız süreç yeniden başlatılarak varsayılmaz. Gerçek cold koşul kurulmadıysa “process-cold / cache bilinmiyor” diye adlandırılır.
-- Güç modu, Defender davranışı ve throttling kaydedilir; bir rakibe özel istisna uygulanmaz.
-- Sorgu motorları mümkünse CLI/SDK ile karşılaştırılır; UI sonuçları ayrı uçtan uca senaryoda ölçülür.
-- Ortalama, p50, p95 ve yeterli örnekte p99; bellek için normal ve tepe değerler sunulur.
-- Sonuçlar CSV/JSON ve çalıştırma komutlarıyla tekrar üretilebilir tutulur. Bu depoda henüz bir benchmark runner yoktur.
-
-## 6. Doğruluk kabul örnekleri
-
-- Dosya oluşturma, büyütme, küçültme, silme; açık dosyada süren yazma.
-- Tek dosya rename/move, büyük klasör taşıma, parent'ın önce/sonra görülmesi.
-- Hard link oluşturma/silme; kalan bağlantı varken alanı serbest saymama.
-- Sparse ve sıkıştırılmış dosyalar; alternate data streams; resident küçük dosya.
-- Junction/symlink döngüleri ve başka birime giden bağlantılar.
-- İzin reddi, kullanıcı değişimi, erişim yetkisinin sonradan kaldırılması.
-- Bulut placeholder'larının içerik indirilmeden işlenmesi.
-- İndeks oluşturulurken eşzamanlı değişiklik; journal wrap/recreate.
-- Uyku/uyanma, disk çıkarma/takma ve sürücü harfinin değişmesi.
-- Checkpoint ile snapshot arasındaki her kritik noktada süreç kesilmesi.
-- MFT referansının yeniden kullanımı; bozuk/yarım snapshot'ın reddi.
-
-Küçük ve kontrol edilen fixture'larda bağımsız Win32 enumerasyonu + metadata sorguları oracle olur. Rakip uygulama tek doğruluk kaynağı sayılmaz. Aktif diskte tam atomik anlık görüntü iddiası kurulmaz; doğruluk kontrolü durağan fixture veya tanımlı değişiklik bariyerinde yapılır.
-
-## 7. İlerleme kapıları
-
-1. Doğruluk fixture'ları geçmeden hız sonucu yayımlanmaz.
-2. İlk fizibilite raporu ad indeksleme ve boyut tamamlama darboğazlarını ayırır.
-3. Rakibi geçmeyen sorgu grupları rapordan çıkarılmaz.
-4. 2 kat hız hedefi tutmazsa veri yerleşimi/sorgu stratejisi yeniden değerlendirilir; sonuç gizlenmez.
-5. UI, yardımcı süreç ve snapshot birleştirmesi ölçülmeden yalnız çekirdek sonucuna dayanarak düşük kaynak iddiası yapılmaz.
+Publish speed results only after applicable correctness cases pass. Separate name enumeration from size completion. Retain slower groups in the report. Revisit layout/strategy if the intended advantage is absent. Do not claim product-wide low resource use from a core-only benchmark before measuring UI/helper/compaction costs.

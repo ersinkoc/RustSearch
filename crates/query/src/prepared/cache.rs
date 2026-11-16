@@ -191,6 +191,7 @@ fn load<'a>(path: &Path, index: &'a Index) -> Result<(SearchIndex<'a>, u32)> {
         index,
         overlay: Vec::new(),
         groups: Vec::new(),
+        summaries: Vec::new(),
         postings: Vec::new(),
         by_extension: Vec::new(),
         by_size: Vec::new(),
@@ -202,6 +203,7 @@ fn load<'a>(path: &Path, index: &'a Index) -> Result<(SearchIndex<'a>, u32)> {
         shadowed_sizes: Vec::new(),
     };
     result.groups.try_reserve_exact(groups as usize)?;
+    result.summaries.try_reserve_exact(groups as usize)?;
     let mut block = vec![0u8; 256 * 1024];
     let mut remaining = groups;
     while remaining > 0 {
@@ -210,9 +212,8 @@ fn load<'a>(path: &Path, index: &'a Index) -> Result<(SearchIndex<'a>, u32)> {
         for bytes in block[..count * 40].chunks_exact(40) {
             let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
             let u32_at = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            result.summaries.push((u64_at(0), u64_at(8)));
             result.groups.push(Group {
-                mask: u64_at(0),
-                chars: u64_at(8),
                 min_id: u64_at(16),
                 key_offset: u32_at(24),
                 key_len_kind: u32_at(28),
@@ -324,7 +325,7 @@ fn validate_groups(cache: &SearchIndex<'_>) -> Result<()> {
     let mut sum = 0u64;
     let mut directories = 0u64;
     let mut previous = None;
-    for group in &cache.groups {
+    for (group_id, group) in cache.groups.iter().enumerate() {
         let key_len = group.key_len_kind & !DIR_BIT;
         ensure!(
             key_len > 0 && group.key_offset as u64 + key_len as u64 <= index.keys.len() as u64,
@@ -348,7 +349,7 @@ fn validate_groups(cache: &SearchIndex<'_>) -> Result<()> {
         );
         previous = Some(order);
         ensure!(
-            (group.mask, group.chars) == summaries(key),
+            cache.summaries[group_id] == summaries(key),
             "search cache mask invalid"
         );
         sum += group.len as u64;
@@ -369,7 +370,7 @@ fn validate(cache: &SearchIndex<'_>) -> Result<()> {
     let mut directories = 0u64;
     let mut expected_sizes = 0usize;
     let mut previous: Option<(&[u8], bool)> = None;
-    for group in &cache.groups {
+    for (group_id, group) in cache.groups.iter().enumerate() {
         let key_len = (group.key_len_kind & !DIR_BIT) as usize;
         ensure!(
             key_len > 0
@@ -394,7 +395,7 @@ fn validate(cache: &SearchIndex<'_>) -> Result<()> {
         );
         previous = Some(order);
         ensure!(
-            (group.mask, group.chars) == summaries(key),
+            cache.summaries[group_id] == summaries(key),
             "search cache mask invalid"
         );
         let rows = &cache.postings[group.start as usize..(group.start + group.len) as usize];
@@ -474,7 +475,7 @@ fn validate_auxiliary(cache: &SearchIndex<'_>, expected_sizes: usize) -> Result<
             .entries
             .get(row as usize)
             .context("search cache size row invalid")?;
-        let rank = (std::cmp::Reverse(e.size), e.id);
+        let rank = (std::cmp::Reverse(index.size(e)), e.id);
         ensure!(
             e.flags & (DIRECTORY | SIZE_KNOWN) == SIZE_KNOWN
                 && previous.is_none_or(|old| old < rank),
@@ -535,9 +536,13 @@ fn save(path: &Path, cache: &SearchIndex<'_>) -> Result<()> {
             hash,
         };
         let mut start = 0u32;
-        for group in &cache.groups {
+        for (group_id, group) in cache.groups.iter().enumerate() {
             let mut bytes = [0; 40];
-            for (at, value) in [(0, group.mask), (8, group.chars), (16, group.min_id)] {
+            for (at, value) in [
+                (0, cache.summaries[group_id].0),
+                (8, cache.summaries[group_id].1),
+                (16, group.min_id),
+            ] {
                 bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
             }
             for (at, value) in [

@@ -536,9 +536,9 @@ fn replay(volume: &Handle, index: &Index, sizes: bool, stats: &mut ScanStats) ->
                             Some(Record {
                                 id,
                                 parent: old.parent,
-                                usn: old.usn,
+                                usn: index.usn(old),
                                 size: None,
-                                flags: old.flags,
+                                flags: index.flags(old),
                                 name: index.name(old).to_vec(),
                             }),
                         );
@@ -622,7 +622,8 @@ pub fn scan_ntfs(volume: &str, size_limit: Option<usize>) -> Result<(Index, Scan
     stats.enumerate_ms = start.elapsed().as_secs_f64() * 1000.;
     if let Some(limit) = size_limit {
         let start = Instant::now();
-        for entry in &mut index.entries {
+        for row in 0..index.entries.len() {
+            let entry = index.entries[row];
             if stats.size_attempts >= limit as u64 {
                 break;
             }
@@ -632,8 +633,7 @@ pub fn scan_ntfs(volume: &str, size_limit: Option<usize>) -> Result<(Index, Scan
             stats.size_attempts += 1;
             match by_id(&handle, entry.id).and_then(|file| logical_size(&file)) {
                 Ok(Some(size)) => {
-                    entry.size = size;
-                    entry.flags |= SIZE_KNOWN;
+                    index.set_size(row, size);
                 }
                 _ => stats.size_failures += 1,
             }
@@ -755,7 +755,7 @@ mod tests {
         let (index, stats) = walk(dir.path(), true).unwrap();
         assert_eq!(stats.records, 3);
         assert_eq!(stats.sized_files, 2);
-        assert_eq!(index.entries.iter().map(|e| e.size).sum::<u64>(), 17);
+        assert_eq!(index.entries.iter().map(|e| index.size(e)).sum::<u64>(), 17);
         let (_, without) = walk(dir.path(), false).unwrap();
         assert_eq!(without.sized_files, 0);
         assert!(walk(&dir.path().join("missing"), true).is_err());

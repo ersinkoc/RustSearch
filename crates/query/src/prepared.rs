@@ -7,8 +7,6 @@ pub use cache::{CacheStats, cache_path};
 const DIR_BIT: u32 = 1 << 31;
 #[derive(Clone, Copy)]
 pub(super) struct Group {
-    mask: u64,
-    chars: u64,
     min_id: u64,
     key_offset: u32,
     key_len_kind: u32,
@@ -73,6 +71,7 @@ pub struct SearchIndex<'a> {
     index: &'a Index,
     overlay: Vec<&'a Entry>,
     groups: Vec<Group>,
+    summaries: Vec<(u64, u64)>,
     postings: Vec<u32>,
     by_extension: Vec<u32>,
     by_size: Vec<u32>,
@@ -97,6 +96,7 @@ impl<'a> SearchIndex<'a> {
             index,
             overlay,
             groups: Vec::new(),
+            summaries: Vec::new(),
             postings: Vec::new(),
             by_extension: Vec::new(),
             by_size: Vec::new(),
@@ -118,9 +118,8 @@ impl<'a> SearchIndex<'a> {
             let dir = entry.flags & DIRECTORY != 0;
             let next = result.groups.len();
             let id = *ids.entry((key, dir)).or_insert_with(|| {
+                result.summaries.push(summaries(key));
                 result.groups.push(Group {
-                    mask: grams(key),
-                    chars: chars(key),
                     min_id: entry.id,
                     key_offset: entry.key_offset,
                     key_len_kind: entry.key_len | if dir { DIR_BIT } else { 0 },
@@ -176,11 +175,21 @@ impl<'a> SearchIndex<'a> {
                     }
                 });
         }
-        result.groups.sort_unstable_by(|a, b| {
+        let mut ordered: Vec<_> = std::mem::take(&mut result.groups)
+            .into_iter()
+            .zip(std::mem::take(&mut result.summaries))
+            .collect();
+        ordered.sort_unstable_by(|(a, _), (b, _)| {
             a.key(index)
                 .cmp(b.key(index))
                 .then(a.directory().cmp(&b.directory()))
         });
+        result.groups.reserve_exact(ordered.len());
+        result.summaries.reserve_exact(ordered.len());
+        for (group, summary) in ordered {
+            result.groups.push(group);
+            result.summaries.push(summary);
+        }
         result.by_extension = (0..result.groups.len() as u32)
             .filter(|&g| {
                 !result.groups[g as usize].directory()
@@ -199,7 +208,7 @@ impl<'a> SearchIndex<'a> {
             } else {
                 overlay[row as usize - index.entries.len()]
             };
-            (std::cmp::Reverse(e.size), e.id)
+            (std::cmp::Reverse(index.size(e)), e.id)
         });
         result.groups.shrink_to_fit();
         result.by_size.shrink_to_fit();
@@ -239,7 +248,7 @@ impl<'a> SearchIndex<'a> {
                 if directory {
                     self.directories -= 1;
                 } else if old.flags & SIZE_KNOWN != 0 {
-                    self.shadowed_sizes.push(old.size);
+                    self.shadowed_sizes.push(self.index.size(old));
                 }
             }
         }
@@ -257,6 +266,7 @@ impl<'a> SearchIndex<'a> {
     }
     pub fn allocated_bytes(&self) -> usize {
         self.groups.capacity() * std::mem::size_of::<Group>()
+            + self.summaries.capacity() * 16
             + self.postings.capacity() * 4
             + self.by_extension.capacity() * 4
             + self.by_size.capacity() * 4
@@ -289,7 +299,7 @@ impl<'a> SearchIndex<'a> {
             if (query.largest || query.min_size.is_some())
                 && (directory
                     || entry.flags & SIZE_KNOWN == 0
-                    || entry.size < query.min_size.unwrap_or(0))
+                    || self.index.size(entry) < query.min_size.unwrap_or(0))
             {
                 continue;
             }
@@ -313,10 +323,10 @@ impl<'a> SearchIndex<'a> {
                 continue;
             }
             let position = if query.largest {
-                let rank = (std::cmp::Reverse(entry.size), entry.id);
+                let rank = (std::cmp::Reverse(self.index.size(entry)), entry.id);
                 result.rows.partition_point(|&id| {
                     let old = self.index.get(id).expect("live result");
-                    (std::cmp::Reverse(old.size), old.id) < rank
+                    (std::cmp::Reverse(self.index.size(old)), old.id) < rank
                 })
             } else {
                 result.rows.partition_point(|id| *id < entry.id)
@@ -390,9 +400,9 @@ impl<'a> SearchIndex<'a> {
             }
         };
         if query.largest || query.min_size.is_some() {
-            let end = self
-                .by_size
-                .partition_point(|&row| self.entry(row).size >= query.min_size.unwrap_or(0));
+            let end = self.by_size.partition_point(|&row| {
+                self.index.size(self.entry(row)) >= query.min_size.unwrap_or(0)
+            });
             if query.largest
                 && key.is_empty()
                 && !matches!(query.mode, Mode::Exact)
@@ -467,6 +477,10 @@ impl<'a> SearchIndex<'a> {
                     Box::new(start..end)
                 };
             for group_id in candidates {
+                let (mask_bits, char_bits) = self.summaries[group_id];
+                if mask_bits & mask != mask || char_bits & char_mask != char_mask {
+                    continue;
+                }
                 let group = &self.groups[group_id];
                 let live_count =
                     group.len - self.removed_by_group.get(group_id).copied().unwrap_or(0);
@@ -477,9 +491,6 @@ impl<'a> SearchIndex<'a> {
                     || matches!(query.kind, Kind::Folder) && !group.directory()
                     || ext.is_some() && group.directory()
                 {
-                    continue;
-                }
-                if group.mask & mask != mask || group.chars & char_mask != char_mask {
                     continue;
                 }
                 if !single_letter || ext.is_some() {

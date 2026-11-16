@@ -1,79 +1,60 @@
 # RustSearch
 
-Windows için düşük kaynak tüketimli dosya arama ve disk alanı analiz uygulaması.
+A Windows file-search and disk-space analysis project focused on fast metadata queries and low resource use.
 
-**Sürüm: 0.0.1.** Windows CLI fizibilite prototipi. NTFS/USN indeksleme, snapshot, ad araması, boyut filtreleri, journal replay ve kaynak ölçümü uygulanmıştır. Masaüstü arayüzü henüz yoktur.
+**Version: 0.0.1 — CLI feasibility prototype.** Native NTFS/USN indexing, persistent snapshots, cached name queries, size filters, committed delta updates, and resource measurements are implemented. The desktop UI and disk-space map are planned.
 
-İlk arama optimizasyonunda sıralı ad grupları, substring aday özetleri, paylaşılan ad havuzları ve ana snapshot'ı değiştirmeyen delta güncellemeleri eklendi. Aynı 12,29 milyon kayıtta sıcak arama ve bellek karşılaştırması [optimizasyon raporunda](docs/OPTIMIZATION_RESULTS.md).
+The first release scope is file/folder search plus disk-space analysis. Content search comes later. All project documentation and user-facing text are in English.
 
-Kalıcı cache denemesinde bu arama yardımcıları `.rsidx.search` cache'inde yeniden kullanılır. `index` ve `compact` cache'i bir kez hazırlar; delta'lar cache'i yeniden yazmadan küçük bir görünüm katmanına bağlanır. Aynı veriyle süreç başlangıcı medyanı 6,06 → 3,05 saniye ölçüldü: [başlangıç/cache raporu](docs/CACHE_RESULTS.md).
+## Current capabilities
 
-Blok okuma optimizasyonunda snapshot ve cache bloklar halinde okunur; checksum ayrıştırmayla aynı geçişte hesaplanır. Doğruluk denetimleri korunarak aynı diskte 12,29 milyon kaydın CLI başlangıcı medyanı 3,07 → 1,60 saniyeye indi. RAM yaklaşık aynı kaldı: [yükleme karşılaştırması](docs/LOAD_RESULTS.md).
+- Native NTFS metadata enumeration on an explicitly selected local volume.
+- Normal directory traversal for accessible folders without elevation.
+- Substring, prefix, exact-name, extension, minimum-size, and largest-file queries.
+- Persistent search tables and small delta overlays that preserve the base snapshot and cache.
+- Full file references and original UTF-16 names, including unpaired surrogates.
+- JSON reports for startup, warm queries, CPU, private commit, working set, and process I/O.
 
-Ölçüm belgelerindeki eski 0.2/0.3/0.4 numaraları yayımlanmamış deney binary etiketleridir. Projenin ilk sürümü 0.0.1 olarak kabul edilir. Ham disk indeksleri ve yerel kanıt dosyaları GitHub deposuna dahil edilmez.
+Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates a native snapshot; there is no background service yet. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
 
-Güncel cache düzeninde aynı verinin hazırlığı 1,20 → 0,78 saniye, toplam CLI başlangıcı 1,71 → 1,19 saniye ölçüldü; RAM yaklaşık aynı kaldı: [cache doğrulama raporu](docs/CACHE_VALIDATION_RESULTS.md).
+## Build and try
 
-## Ürün fikri
-
-Tek bir güncel dosya indeksinden üç soruya cevap ver:
-
-- Dosyam nerede? Ad, yol, uzantı, boyut ve tarihle anlık arama.
-- Alanı ne tüketiyor? Klasör ağacı, boyut sıralaması ve etkileşimli disk haritası.
-- En büyük dosyalar hangileri? Tüm disklerde veya seçilen klasörde büyük dosya listesi.
-
-İlk sürüm dosya içeriklerini indekslemez. Bu kapsam kullanıcı tarafından 16 Kasım 2026 tarihinde seçilmiştir.
-
-## Temel yaklaşım
-
-- Rust çekirdek, Windows API entegrasyonu ve yerel masaüstü arayüzü.
-- Önce yerel NTFS diskleri; başlangıç için Windows 11 x64.
-- İsim indeksi için toplu metadata okuma, güncellemeler için USN Journal.
-- Arama, klasör toplamları ve disk haritası için ortak veri modeli.
-- Sınırlı iş kuyrukları, iptal edilebilir sorgular, olay tabanlı güncelleme.
-- Dosya içeriklerini okumadan metadata üzerinden çalışma.
-- Yerel veri; hesap, bulut veya telemetri gerektirmeyen kullanım.
-
-## Hız iddiası
-
-Everything zaten hızlı indeksleme ve arama sunuyor; klasör boyutu indeksleme desteği de var. Rust kullanmak veya MFT okumak tek başına üstünlük kanıtı değildir. Hedefimiz, eşdeğer kapsam ve doğrulukta daha düşük kaynak tüketimiyle özellikle büyük indekslerde ve aramadan disk analizine geçişte ölçülebilir avantaj üretmek.
-
-“Everything'den daha hızlı” ifadesi ancak sürümü ve ayarları kaydedilmiş karşılaştırmalarla kullanılacak. Hedefler, henüz ölçülmüş sonuç değildir.
-
-## Belgeler
-
-- [Ürün, mimari ve aşamalı geliştirme planı](docs/PROJECT_PLAN.md)
-- [Performans hedefleri ve karşılaştırma protokolü](docs/BENCHMARKS.md)
-- [CLI derleme, kullanım ve kapsam sınırları](docs/CLI.md)
-- [Gerçek NTFS diskinde A aşaması sonuçları](docs/PHASE_A_RESULTS.md)
-- [Arama, bellek ve delta güncellemesi karşılaştırması](docs/OPTIMIZATION_RESULTS.md)
-- [Kalıcı arama cache'i ve başlangıç karşılaştırması](docs/CACHE_RESULTS.md)
-- [Snapshot/cache yükleme ve delta doğruluğu karşılaştırması](docs/LOAD_RESULTS.md)
-- [Cache düzeni, doğrulama ve başlangıç karşılaştırması](docs/CACHE_VALIDATION_RESULTS.md)
-
-## Hızlı başlangıç
-
-Windows, Rust 1.93+ ve MSVC C++ build araçları gerekir. Bağımlılıklar `Cargo.lock` ile sabitlenmiştir.
+Windows, Rust 1.93+ with the MSVC toolchain, and MSVC C++ build tools are required. Dependencies are pinned in `Cargo.lock`.
 
 ```powershell
 cargo build --release --locked
 New-Item -ItemType Directory -Path .temp_files -Force
 
-# Normal kullanıcı: erişilebilir bir klasörün snapshot'ı.
+# Normal user: scan an accessible folder.
 .\target\release\rustsearch.exe index --root .\crates --sizes --output .temp_files\local.rsidx
 .\target\release\rustsearch.exe search --index .temp_files\local.rsidx --ext rs
 
-# Yönetici PowerShell: bütün D: biriminin native NTFS ad indeksi.
+# Elevated PowerShell: enumerate the entire D: NTFS volume.
 .\target\release\rustsearch.exe index --volume D: --output .temp_files\native.rsidx
-.\target\release\rustsearch.exe bench --index .temp_files\native.rsidx --iterations 1000 --report .temp_files\bench.json
+.\target\release\rustsearch.exe refresh --index .temp_files\native.rsidx --sizes
 ```
 
-Native prototip dosya referansı başına tek canonical ad tutar; ek hard-link adlarını henüz listelemez. `--sizes` kullanılmadığında boyutlar bilinmiyor olarak kalır. Snapshot canlı değildir: native indeks `refresh` ile güncellenir, klasör taraması yeniden oluşturulur. İçerik araması ve diskte ayrılmış fiziksel alan hesabı yoktur.
+## Performance evidence
 
-## Resmî kaynaklar
+The retained real-disk corpus has 12.29 million records. Each report separates correctness, startup, warm query time, and memory. These are measurements of this prototype, not evidence that it beats Everything.
 
-- [Everything: indeksler ve klasör boyutları](https://www.voidtools.com/support/everything/indexes/)
-- [Microsoft: NTFS metadata enumerasyonu](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_enum_usn_data)
-- [Microsoft: USN değişiklik günlüğü](https://learn.microsoft.com/en-us/windows/win32/fileio/change-journals)
+The latest comparison reduced cached-search private memory from about 1,086 MB to 887 MB (18.3%), with working set also falling. Median CLI startup stayed close at 1.15 versus 1.13 seconds. Query-specific results and construction costs are included in the memory report.
 
-Araştırma tarihi: 16 Kasım 2026. Bu depo Everything veya voidtools ile bağlantılı değildir.
+- [Initial native disk feasibility](docs/PHASE_A_RESULTS.md)
+- [Name grouping, shared arenas, and delta writes](docs/OPTIMIZATION_RESULTS.md)
+- [Persistent search cache](docs/CACHE_RESULTS.md)
+- [Single-pass snapshot/cache loading](docs/LOAD_RESULTS.md)
+- [Sequential cache membership validation](docs/CACHE_VALIDATION_RESULTS.md)
+- [Compact in-memory metadata and names](docs/MEMORY_RESULTS.md)
+
+Earlier 0.2/0.3/0.4 labels in historical reports identify unpublished experiment binaries. The project version remains **0.0.1**. Raw disk snapshots and local metadata evidence are excluded from this public repository.
+
+## Project documentation
+
+- [CLI commands and limitations](docs/CLI.md)
+- [Product and technical plan](docs/PROJECT_PLAN.md)
+- [Benchmark protocol and engineering targets](docs/BENCHMARKS.md)
+
+Everything already provides fast metadata indexes and optional folder-size indexing. Rust or NTFS enumeration alone does not establish an advantage. A competitive claim requires the same hardware, indexed scope, query semantics, freshness, and ordering, with recorded competitor versions and settings.
+
+Reference material consulted during the initial research on 16 November 2026: [Everything indexes](https://www.voidtools.com/support/everything/indexes/), [Microsoft NTFS enumeration](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_enum_usn_data), and [USN change journals](https://learn.microsoft.com/en-us/windows/win32/fileio/change-journals). This project is not affiliated with Everything or voidtools.

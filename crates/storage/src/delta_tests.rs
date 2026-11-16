@@ -61,7 +61,7 @@ fn delta_append_preserves_base_and_replays_committed_transactions_only() {
     assert_eq!(std::fs::read(&path).unwrap(), base);
     let updated = load(&path).unwrap();
     assert!(updated.get(2).is_none());
-    assert_eq!(updated.get(3).unwrap().size, 42);
+    assert_eq!(updated.size(updated.get(3).unwrap()), 42);
     assert_eq!(updated.log_sequence, 1);
     assert!(
         append_delta(&guard, &index, &delta).is_err(),
@@ -74,7 +74,8 @@ fn delta_append_preserves_base_and_replays_committed_transactions_only() {
         assert_eq!(recovered.log_sequence, 0);
         assert!(recovered.get(2).is_some());
         append_delta(&guard, &recovered, &transaction(&recovered)).unwrap();
-        assert_eq!(load(&path).unwrap().get(3).unwrap().size, 42);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.size(loaded.get(3).unwrap()), 42);
     }
     let mut damaged = log;
     damaged[50] ^= 1;
@@ -100,9 +101,9 @@ fn writer_lock_generation_and_new_path_compaction_are_enforced() {
     assert_eq!(compacted.log_sequence, 0);
     assert!(compacted.updates.is_empty());
     assert!(compacted.get(2).is_none());
-    assert_eq!(compacted.get(3).unwrap().size, 42);
+    assert_eq!(compacted.size(compacted.get(3).unwrap()), 42);
     let mut other = fixture();
-    other.entries[0].size = 123;
+    other.set_size(0, 123);
     let another = dir.path().join("another.rsidx");
     save(&another, &other).unwrap();
     std::fs::copy(delta_path(&path), delta_path(&another)).unwrap();
@@ -125,11 +126,11 @@ fn interrupted_second_frame_preserves_first_commit_and_can_be_retried() {
     std::fs::write(delta_path(&path), &log[..log.len() - 2]).unwrap();
     let recovered = load(&path).unwrap();
     assert_eq!(recovered.log_sequence, 1);
-    assert_eq!(recovered.get(3).unwrap().size, 42);
+    assert_eq!(recovered.size(recovered.get(3).unwrap()), 42);
     append_delta(&guard, &recovered, &delta).unwrap();
     let complete = load(&path).unwrap();
     assert_eq!(complete.log_sequence, 2);
-    assert_eq!(complete.get(3).unwrap().size, 99);
+    assert_eq!(complete.size(complete.get(3).unwrap()), 99);
 }
 
 #[test]
