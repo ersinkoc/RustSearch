@@ -1,0 +1,16 @@
+[package]
+name = "rustsearch-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+rustsearch-core.workspace = true
+crc32fast = "1.5"
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"

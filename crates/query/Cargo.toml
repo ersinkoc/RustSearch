@@ -1,0 +1,16 @@
+[package]
+name = "rustsearch-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustsearch-core.workspace = true
+memchr = "2.8"
+anyhow.workspace = true
+serde.workspace = true
+rustsearch-storage.workspace = true
+crc32fast = "1.5"
+
+[dev-dependencies]
+tempfile = "3.27"

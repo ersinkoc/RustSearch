@@ -1,0 +1,9 @@
+/target/
+/.temp_files/
+*.rsidx
+*.rsidx.delta
+*.rsidx.lock
+*.rsidx.tmp-*
+*.rsidx.search
+*.rsidx.search.lock
+*.rsidx.search.tmp-*
