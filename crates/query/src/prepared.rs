@@ -378,6 +378,13 @@ impl<'a> SearchIndex<'a> {
         let single_letter = matches!(query.mode, Mode::Contains)
             && key.len() == 1
             && (key[0].is_ascii_lowercase() || key[0].is_ascii_digit());
+        if single_letter && ext.is_none() && query.min_size.is_none() && !query.largest {
+            return if self.removed_by_group.is_empty() {
+                self.execute_single_ascii::<false>(char_mask, query.kind, query.limit)
+            } else {
+                self.execute_single_ascii::<true>(char_mask, query.kind, query.limit)
+            };
+        }
         let matches_name = |name: &[u8]| match query.mode {
             Mode::Contains => finder.find(name).is_some(),
             Mode::Prefix => name.starts_with(&key),
@@ -535,5 +542,58 @@ impl<'a> SearchIndex<'a> {
             result.rows = smallest.into_sorted_vec();
         }
         result
+    }
+
+    /// Letter/digit bits are exact memberships, unlike hashed punctuation/non-ASCII bits.
+    /// Scan the existing arrays directly without generic candidate/matching dispatch.
+    fn execute_single_ascii<const WITH_DELTAS: bool>(
+        &self,
+        char_mask: u64,
+        kind: Kind,
+        limit: usize,
+    ) -> Matches {
+        let mut total = 0usize;
+        let mut smallest = BinaryHeap::<u64>::new();
+        for (group_id, (group, &(_, characters))) in
+            self.groups.iter().zip(&self.summaries).enumerate()
+        {
+            if characters & char_mask == 0
+                || matches!(kind, Kind::File) && group.directory()
+                || matches!(kind, Kind::Folder) && !group.directory()
+            {
+                continue;
+            }
+            let removed = if WITH_DELTAS {
+                self.removed_by_group[group_id]
+            } else {
+                0
+            };
+            let count = group.len - removed;
+            total += count as usize;
+            if count == 0
+                || limit == 0
+                || smallest.len() == limit
+                    && smallest.peek().is_some_and(|worst| group.min_id >= *worst)
+            {
+                continue;
+            }
+            for &row in &self.postings[group.start as usize..(group.start + group.len) as usize] {
+                if WITH_DELTAS && self.is_shadowed(row) {
+                    continue;
+                }
+                let id = self.entry(row).id;
+                if smallest.len() == limit && smallest.peek().is_some_and(|worst| id >= *worst) {
+                    break;
+                }
+                if smallest.len() == limit {
+                    smallest.pop();
+                }
+                smallest.push(id);
+            }
+        }
+        Matches {
+            total,
+            rows: smallest.into_sorted_vec(),
+        }
     }
 }

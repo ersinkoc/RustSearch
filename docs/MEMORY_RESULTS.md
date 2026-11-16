@@ -1,5 +1,7 @@
 # Compact metadata memory — 17 November 2026
 
+The reported common-substring regression was addressed in the subsequent [direct ASCII scan comparison](COMMON_SUBSTRING_RESULTS.md). This report retains its original measurements.
+
 Version remains **0.0.1**. On the same frozen 12,285,803-record D: corpus, median private commit fell from **1,086,283,776 to 887,255,040 bytes**: **18.3% less**, or **189.8 MiB saved**. Working set and process peak private commit fell as well. This is an actual reduction of stored heap data, not a change to memory mapping or working-set trimming.
 
 ## Data layout

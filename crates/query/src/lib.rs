@@ -215,6 +215,109 @@ mod tests {
     }
 
     #[test]
+    fn single_ascii_queries_match_linear_across_filters_and_delta_generations() {
+        use rustsearch_core::Delta;
+        let mut index = fixture();
+        for id in 100..300 {
+            index
+                .push(Record {
+                    id,
+                    parent: 1,
+                    usn: 0,
+                    size: (id % 3 != 0).then_some(id),
+                    flags: if id % 7 == 0 { DIRECTORY } else { 0 },
+                    name: format!("Az09-{:02}-🙂-Ω.pdf", id % 13)
+                        .encode_utf16()
+                        .collect(),
+                })
+                .unwrap();
+        }
+        index.finish().unwrap();
+        for generation in 0..3 {
+            if generation > 0 {
+                let records = if generation == 1 {
+                    std::collections::BTreeMap::from([
+                        (2, None),
+                        (
+                            100,
+                            Some(Record {
+                                id: 100,
+                                parent: 1,
+                                usn: 1,
+                                size: Some(0),
+                                flags: DIRECTORY,
+                                name: "no-match-folder".encode_utf16().collect(),
+                            }),
+                        ),
+                        (
+                            500,
+                            Some(Record {
+                                id: 500,
+                                parent: 1,
+                                usn: 1,
+                                size: Some(99),
+                                flags: 0,
+                                name: "AZ09-created.pdf".encode_utf16().collect(),
+                            }),
+                        ),
+                    ])
+                } else {
+                    std::collections::BTreeMap::from([
+                        (500, None),
+                        (
+                            100,
+                            Some(Record {
+                                id: 100,
+                                parent: 1,
+                                usn: 2,
+                                size: None,
+                                flags: 0,
+                                name: "AZ09-renamed.txt".encode_utf16().collect(),
+                            }),
+                        ),
+                    ])
+                };
+                index
+                    .apply_delta(Delta {
+                        previous_sequence: index.log_sequence,
+                        previous_checkpoint: index.metadata.checkpoint.clone(),
+                        metadata: index.metadata.clone(),
+                        records,
+                    })
+                    .unwrap();
+            }
+            let prepared = SearchIndex::build(&index);
+            // Punctuation and Unicode control cases must still use real name matching.
+            for byte in b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" {
+                for kind in [Kind::Any, Kind::File, Kind::Folder] {
+                    for limit in [0, 1, 17, 1000] {
+                        for min_size in [None, Some(0), Some(150)] {
+                            for extension in [None, Some("pdf")] {
+                                for largest in [false, true] {
+                                    let query = Query {
+                                        text: (*byte as char).to_string(),
+                                        mode: Mode::Contains,
+                                        kind,
+                                        limit,
+                                        min_size,
+                                        extension: extension.map(str::to_string),
+                                        largest,
+                                    };
+                                    assert_eq!(
+                                        prepared.execute(&query),
+                                        query.execute(&index),
+                                        "generation={generation}, {query:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn prepared_queries_equal_linear_for_duplicates_unicode_filters_and_deltas() {
         use rustsearch_core::Delta;
         let mut index = fixture();

@@ -46,8 +46,11 @@ The latest comparison reduced cached-search private memory from about 1,086 MB t
 - [Single-pass snapshot/cache loading](docs/LOAD_RESULTS.md)
 - [Sequential cache membership validation](docs/CACHE_VALIDATION_RESULTS.md)
 - [Compact in-memory metadata and names](docs/MEMORY_RESULTS.md)
+- [Common ASCII substring scan without additional index memory](docs/COMMON_SUBSTRING_RESULTS.md)
 
 Earlier 0.2/0.3/0.4 labels in historical reports identify unpublished experiment binaries. The project version remains **0.0.1**. Raw disk snapshots and local metadata evidence are excluded from this public repository.
+
+The common one-character substring follow-up reduced the `a` query from 12.04 to 6.01 ms on the same corpus, with unchanged source/search-table allocations. With two deltas it improved from 12.17 to 6.88 ms; see the common-substring report for all query groups and memory counters.
 
 ## Project documentation
 

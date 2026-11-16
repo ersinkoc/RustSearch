@@ -61,6 +61,8 @@ The default indexed strategy uses binary lookup for exact/prefix/extension searc
 
 Unknown sizes are excluded from size-filtered and largest-file results. `logical_size: 0` differs from `logical_size: null`. Check `unknown_size_files` and `pending_refresh` before relying on coverage.
 
+Single ASCII letter/digit substring queries without extension/size/largest filters scan exact character bits directly in the existing group arrays. File/folder selection, full counts, top-k ordering, shadowed base rows, and overlay merging remain supported. Other queries retain the general matching paths. See [common-substring results](COMMON_SUBSTRING_RESULTS.md).
+
 ## Persistent cache and compact memory
 
 `index` and `compact` prepare `.rsidx.search` once by default. The next separate CLI query can use a cache hit. `--no-cache` skips preparation on those commands; on `search`, `bench`, and `idle`, it rebuilds in memory without reading or writing the cache.
