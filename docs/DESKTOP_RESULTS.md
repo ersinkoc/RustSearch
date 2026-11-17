@@ -72,3 +72,7 @@ The corrected mark rendered in the rebuilt application. The toolbar's drive coun
 An independent normal-user directory scan of the small FAT F: volume matched `Get-ChildItem -Recurse -Force`: four records, three files, one folder, zero skipped entries, and all three file sizes known. This checks the same traversal backend used by Accessible files, separately from GUI acceptance. It does not establish coverage of C:, D:, or E: or an administrator-mode native scan.
 
 ![Combined largest-file results with generated fixture files](assets/desktop-multi-drive.jpg)
+
+## Open upstream dependency alert
+
+GitHub reports [GHSA-38c5-483c-4qqp](https://github.com/becheran/grid/security/advisories/GHSA-38c5-483c-4qqp), a moderate integer-overflow advisory in `grid::Grid::expand_rows`. The desktop dependency chain is GPUI 0.2.2 → pinned Taffy 0.9.0 → grid 0.18.0. The advisory's patched version is grid 1.0.1, outside Taffy's current requirement; replacing it is not a compatible lockfile-only update. No `expand_rows` call was found in the installed Taffy 0.9.0 source, but the dependency alert remains open. This source inspection is not a full security audit. The CLI's default dependency graph does not include this GUI layout stack.
