@@ -1,4 +1,6 @@
 /target/
+__pycache__/
+*.pyc
 /.temp_files/
 *.rsidx
 *.rsidx.delta

@@ -82,7 +82,89 @@ pub struct SearchIndex<'a> {
     shadowed_count: usize,
     shadowed_sizes: Vec<u64>,
 }
+/// Reference-free immutable tables moved across delta application, without copying the base.
+pub struct SearchTables {
+    identity: Option<[u8; 24]>,
+    rows: usize,
+    groups: Vec<Group>,
+    summaries: Vec<(u64, u64)>,
+    postings: Vec<u32>,
+    by_extension: Vec<u32>,
+    by_size: Vec<u32>,
+    base_directories: usize,
+}
+impl SearchTables {
+    pub fn attach(self, index: &Index) -> anyhow::Result<SearchIndex<'_>> {
+        anyhow::ensure!(
+            self.identity == index.snapshot_identity && self.rows == index.entries.len(),
+            "search tables belong to a different base snapshot"
+        );
+        let mut result = SearchIndex {
+            index,
+            overlay: vec![],
+            groups: self.groups,
+            summaries: self.summaries,
+            postings: self.postings,
+            by_extension: self.by_extension,
+            by_size: self.by_size,
+            directories: self.base_directories,
+            base_directories: self.base_directories,
+            shadowed: vec![],
+            removed_by_group: vec![],
+            shadowed_count: 0,
+            shadowed_sizes: vec![],
+        };
+        result.bind_deltas();
+        Ok(result)
+    }
+}
 impl<'a> SearchIndex<'a> {
+    pub fn detach(self) -> SearchTables {
+        SearchTables {
+            identity: self.index.snapshot_identity,
+            rows: self.index.entries.len(),
+            groups: self.groups,
+            summaries: self.summaries,
+            postings: self.postings,
+            by_extension: self.by_extension,
+            by_size: self.by_size,
+            base_directories: self.base_directories,
+        }
+    }
+    /// Find a child without allocating all exact-name matches or materializing paths.
+    pub fn child(&self, parent: u64, name: &[u16]) -> Option<&'a Entry> {
+        let key = rustsearch_core::search_key(name);
+        let start = self
+            .groups
+            .partition_point(|g| g.key(self.index) < key.as_slice());
+        let mut folded = None;
+        for group in self.groups[start..]
+            .iter()
+            .take_while(|g| g.key(self.index) == key.as_slice())
+        {
+            for &row in &self.postings[group.start as usize..(group.start + group.len) as usize] {
+                if self.is_shadowed(row) {
+                    continue;
+                }
+                let entry = self.entry(row);
+                if entry.parent == parent {
+                    if self.index.name(entry) == name {
+                        return Some(entry);
+                    }
+                    folded = Some(entry);
+                }
+            }
+        }
+        for &entry in &self.overlay {
+            if entry.parent == parent && self.index.key(entry) == key.as_slice() {
+                if self.index.name(entry) == name {
+                    return Some(entry);
+                }
+                folded = Some(entry);
+            }
+        }
+        folded
+    }
     pub fn build(index: &'a Index) -> Self {
         assert!(
             index.entries.len() + index.updates.len() < u32::MAX as usize,

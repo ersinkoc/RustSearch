@@ -6,6 +6,10 @@ A Windows file-search and disk-space analysis project focused on fast metadata q
 
 The first release scope is file/folder search plus disk-space analysis. Content search comes later. All project documentation and user-facing text are in English.
 
+## Download
+
+The [0.0.1 Windows x64 portable alpha](https://github.com/ersinkoc/RustSearch/releases/tag/v0.0.1) includes the GUI and CLI. Extract the ZIP and open `rustsearch-desktop.exe`. The build is unsigned; see the [portable guide](docs/PORTABLE.md) for runtime requirements, background/startup settings, and limitations. SHA-256 checksums and third-party license notices accompany the binaries.
+
 ## Current capabilities
 
 - Native NTFS metadata enumeration on an explicitly selected local volume.
@@ -17,10 +21,12 @@ The first release scope is file/folder search plus disk-space analysis. Content 
 - A native GPUI interface that opens existing indexes or indexes accessible folders without elevation.
 - A drive-selection screen, persistent computer catalogs, combined multi-drive queries, and per-drive coverage reporting.
 - An embedded Windows application icon and file-type symbols for easier scanning of results.
+- Automatic computer indexing, a per-user background worker, live delta updates, and optional sign-in startup.
+- Native Windows window controls and a Settings page for worker lifecycle and indexing scope.
 
 ![RustSearch desktop using a generated test fixture](docs/assets/desktop-dark.jpg)
 
-Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates a native snapshot; there is no background service yet. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
+Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates CLI-native snapshots; the desktop has a separate per-user background worker for managed sources. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
 
 ## Build and try
 
@@ -43,10 +49,12 @@ Build and launch the desktop app separately:
 
 ```powershell
 cargo build -p rustsearch-desktop --release --locked
+.\target\release\rustsearch-desktop.exe
+# Optional standalone snapshot view:
 .\target\release\rustsearch-desktop.exe --index .temp_files\local.rsidx
 ```
 
-Choose **This computer** to select local drives and index them together, **Index a folder** for a smaller normal-user scan, or **Open index** for a snapshot/computer catalog. Accessible files works without elevation; Fast NTFS requires running the app as administrator. The desktop opens committed delta views and reuses existing search caches. Reload rereads the source; it does not run a USN refresh. See the [desktop guide](docs/DESKTOP.md) and [verification results](docs/DESKTOP_RESULTS.md).
+A normal launch starts automatic accessible-drive indexing. Use **Settings** for pause, background, and Start with Windows controls, **This computer** to change selected drives, **Index a folder** for a smaller normal-user scan, or **Open index** for a snapshot/computer catalog. Accessible files works without elevation; Fast NTFS requires running the app as administrator. The managed worker keeps indexes current using filesystem notifications or native USN refresh where available. Explicitly opened snapshots remain read-only. See the [desktop guide](docs/DESKTOP.md) and [verification results](docs/DESKTOP_RESULTS.md).
 
 ## Performance evidence
 
@@ -72,6 +80,7 @@ The common one-character substring follow-up reduced the `a` query from 12.04 to
 - [Desktop app and shortcuts](docs/DESKTOP.md)
 - [Desktop visual and correctness checks](docs/DESKTOP_RESULTS.md)
 - [Product and technical plan](docs/PROJECT_PLAN.md)
+- [Everything baseline and feature gaps](docs/FEATURE_BASELINE.md)
 - [Benchmark protocol and engineering targets](docs/BENCHMARKS.md)
 
 Everything already provides fast metadata indexes and optional folder-size indexing. Rust or NTFS enumeration alone does not establish an advantage. A competitive claim requires the same hardware, indexed scope, query semantics, freshness, and ordering, with recorded competitor versions and settings.

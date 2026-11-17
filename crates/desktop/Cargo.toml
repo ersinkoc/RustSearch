@@ -17,6 +17,9 @@ rustsearch-query.workspace = true
 rustsearch-storage.workspace = true
 rustsearch-windows.workspace = true
 async-channel = "2.5"
+windows-sys.workspace = true
+raw-window-handle = "0.6"
+notify = { version = "=7.0.0", default-features = false }
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
 gpui-component = { version = "=0.5.1", default-features = false }
 gpui-component-assets = "=0.5.1"

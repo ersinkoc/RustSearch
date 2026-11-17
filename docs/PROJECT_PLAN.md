@@ -39,7 +39,7 @@ Content/OCR/semantic search, duplicate detection, continuous hashing, automatic 
 | Windows APIs | Narrow `windows-sys` FFI boundary with required features only |
 | UI | Rust GPUI with virtual results and a single background index owner; disk map and accessibility acceptance remain future work |
 | Index | Versioned snapshot, shared name/key pools, bounded committed delta layer |
-| Updates | NTFS USN journal plus targeted metadata refresh |
+| Updates | Per-user worker, filesystem notifications, durable deltas, NTFS journal refresh, and visible reconciliation |
 | Settings | Small local configuration; no general-purpose database required on the hot path |
 | Persistence | Atomic snapshot publication, durable checkpoints, source validation |
 
@@ -56,7 +56,7 @@ flowchart TD
     E --> I[Snapshot and checkpoint]
 ```
 
-A single normal-user core should own the index; avoid copies in separate UI/query processes. Stop rendering and icon/preview work while hidden. A narrow elevated helper may read volume metadata; it must not execute arbitrary client commands or perform Shell actions as administrator. Service installation, autostart, session lifecycle, and IPC permissions require explicit acceptance before deployment.
+A single normal-user core should own the index; avoid copies in separate UI/query processes. Stop rendering and icon/preview work while hidden. A narrow elevated helper may read volume metadata; it must not execute arbitrary client commands or perform Shell actions as administrator. The selected implementation is a per-user background worker with optional current-user sign-in startup. It owns search and metadata once, exposes authenticated local IPC, and persists private files. A machine-wide service/elevated-helper installation remains a separate future design.
 
 ## NTFS correctness
 
@@ -105,7 +105,7 @@ Measure normal operation, mutation bursts, and old/new generation overlap during
 | E: beta/distribution | Installer/update/helper lifecycle | Windows acceptance and versioned competitor comparisons |
 | F: expansion | Other filesystems, NAS, optional content search | Separate coverage and resource budget for each mode |
 
-The CLI has implemented parts of A and B. The GPUI desktop alpha implements virtual results, file actions, filters, largest files, themes, and an index overview from D. The parser, tray/global shortcut, accessibility acceptance, full size coverage, allocated-space accuracy, and disk analysis remain unfinished. Content search should use a separate opt-in index for selected folders/types; OCR/semantic search must not become a mandatory metadata cost. Estimate delivery dates after size-collection and UI-inclusive resource budgets are measured.
+The CLI has implemented parts of A and B. The GPUI desktop alpha implements virtual results, file actions, filters, largest files, themes, and an index overview from D. The parser, tray/global shortcut, accessibility acceptance, full size coverage, allocated-space accuracy, and disk analysis remain unfinished. Automatic managed indexing, live notifications/deltas, background lifetime, native window controls, and optional sign-in startup are implemented. See the [feature baseline](FEATURE_BASELINE.md) for the remaining parity and differentiation work. Content search should use a separate opt-in index for selected folders/types; OCR/semantic search must not become a mandatory metadata cost. Estimate delivery dates after size-collection and UI-inclusive resource budgets are measured.
 
 The competitive hypothesis is faster transitions between search and disk analysis with compact metadata, selective helpers, and clear freshness. A 2x p95 improvement in comparable large-index query classes is an engineering aim, not a guarantee. Do not omit slower query classes or ignore CPU/RAM/I/O tradeoffs. See the [benchmark protocol](BENCHMARKS.md).
 

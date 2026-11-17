@@ -73,6 +73,33 @@ An independent normal-user directory scan of the small FAT F: volume matched `Ge
 
 ![Combined largest-file results with generated fixture files](assets/desktop-multi-drive.jpg)
 
+## Background worker and native-frame acceptance
+
+The Windows release follow-up passes **56 tests** with zero failures, ignored tests, or filtered tests. The full workspace release test suite, strict release Clippy, formatting check, and release binaries/examples build pass on the release sources. New coverage includes authenticated bounded worker IPC, Windows accepted-socket blocking mode, updates with a disconnected GUI client, pause/resume, isolated current-user startup registration, safe generation retention, original Unicode directory moves, and search-table reuse across deltas.
+
+A deterministic regression first reproduced notification-queue overflow after 10,000 repeated metadata writes to one path. Coalescing now rereads that path once between structural-event barriers. Rename ordering and actual notification-loss recovery remain intact. This does not eliminate genuine overflow during heavy filesystem churn.
+
+Direct Windows acceptance on the rebuilt native-frame binary verified:
+
+| Action | Observed result |
+| --- | --- |
+| Alt+Space with the search input focused | Native system menu opened, with Move, Size, Minimize, Maximize, and Close |
+| Maximize and Restore | Native accessibility state changed to Restore, then back to Maximize |
+| Minimize and reactivate | Windows reported a minimized window; reactivation restored it |
+| Mouse resize from the left edge | Width changed from 1262 to 1142 captured pixels, with the opposite edge fixed |
+| Caption drag | Window origin moved by the requested 80 × 50 pixels without resizing |
+| Alt+F4 and caption Close | GUI exited; the independent worker remained running |
+| Compact live results | 44 fixture records at 960 × 600 logical client size; inspector hidden and footer visible |
+| Settings Pause and Resume | Running/paused status and source freshness labels changed; settings persisted |
+
+The old GPUI caption was replaced with the native frame. A small HWND subclass keeps non-client mouse handling and Alt+Space/Alt+F4 in Windows' default procedure; ordinary client input and GPUI window lifecycle messages retain the framework handler. Without that routing, the framework could consume native resize clicks and the system-menu shortcut.
+
+The worker acceptance used two generated folders outside the index-storage directory. After the GUI closed, a new file produced a durable delta, one matching search row, and 44 combined records. The same worker process survived reconnect. SHA-256 comparisons confirmed that both base snapshots and persistent search caches stayed byte-identical. An earlier fixture placed under the excluded storage root was corrected before making this claim. No private disk filenames are published.
+
+The actual C:/D:/E: worker was restarted with its saved size-collection and sign-in-startup preferences. Its status showed active scanning. This is not acceptance of complete machine coverage or long-duration freshness: accessible scans can be slow and genuine notification loss can trigger reconciliation. Native volume access, Windows sign-in/reboot, clean-machine startup, mixed DPI, and screen-reader acceptance were not added by this run.
+
+![Background indexing settings using generated fixture sources](assets/desktop-background.jpg)
+
 ## Open upstream dependency alert
 
 GitHub reports [GHSA-38c5-483c-4qqp](https://github.com/becheran/grid/security/advisories/GHSA-38c5-483c-4qqp), a moderate integer-overflow advisory in `grid::Grid::expand_rows`. The desktop dependency chain is GPUI 0.2.2 → pinned Taffy 0.9.0 → grid 0.18.0. The advisory's patched version is grid 1.0.1, outside Taffy's current requirement; replacing it is not a compatible lockfile-only update. No `expand_rows` call was found in the installed Taffy 0.9.0 source, but the dependency alert remains open. This source inspection is not a full security audit. The CLI's default dependency graph does not include this GUI layout stack.

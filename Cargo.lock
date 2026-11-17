@@ -5109,6 +5109,8 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "notify",
+ "raw-window-handle",
  "rustsearch-core",
  "rustsearch-query",
  "rustsearch-storage",
@@ -5116,6 +5118,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

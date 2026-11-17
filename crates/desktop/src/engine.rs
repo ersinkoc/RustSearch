@@ -2,6 +2,7 @@ use crate::catalog::Catalog;
 use anyhow::{Context, Result, ensure};
 use rustsearch_core::{DIRECTORY, Index, SIZE_KNOWN};
 use rustsearch_query::{Kind, Mode, Query, SearchIndex};
+use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
@@ -11,7 +12,7 @@ use std::{
     time::Instant,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SearchSpec {
     pub text: String,
     pub kind: Kind,
@@ -22,14 +23,18 @@ pub struct SearchSpec {
     pub limit: usize,
     pub source: Option<usize>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScanMode {
+    #[default]
     Accessible,
     Native,
 }
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Cancel,
+    Current {
+        generation: u64,
+    },
     Open {
         path: PathBuf,
         generation: u64,
@@ -54,7 +59,7 @@ pub enum Request {
         search: SearchSpec,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VolumeSummary {
     pub root: String,
     pub records: usize,
@@ -62,7 +67,7 @@ pub struct VolumeSummary {
     pub skipped: u64,
     pub reparse: u64,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceInfo {
     pub path: PathBuf,
     pub root: String,
@@ -79,8 +84,9 @@ pub struct SourceInfo {
     pub cache_state: String,
     pub volumes: Vec<VolumeSummary>,
     pub warnings: Vec<String>,
+    pub live: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     pub id: u64,
     pub source: usize,
@@ -92,8 +98,9 @@ pub struct Row {
     pub size: Option<u64>,
     pub lossy_display: bool,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Event {
+    Runtime(crate::worker::Runtime),
     Progress {
         generation: u64,
         records: u64,
@@ -121,6 +128,8 @@ struct Mailbox {
     pending: Mutex<Pending>,
     wake: Condvar,
     generation: AtomicU64,
+    loading: std::sync::atomic::AtomicBool,
+    control: Option<Arc<crate::live::Control>>,
 }
 impl Mailbox {
     fn take(&self) -> Option<Request> {
@@ -135,8 +144,31 @@ impl Mailbox {
             pending = self.wake.wait(pending).unwrap_or_else(|e| e.into_inner());
         }
     }
+    fn poll(&self) -> (bool, Option<Request>) {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = if pending.request.is_none() && !pending.stopped {
+            self.wake
+                .wait_timeout(pending, std::time::Duration::from_millis(250))
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+        } else {
+            pending
+        };
+        (pending.stopped, pending.request.take())
+    }
     fn current(&self, generation: u64) -> bool {
         self.generation.load(Ordering::Acquire) == generation
+    }
+    fn scanning(&self, generation: u64) -> bool {
+        while self.current(generation)
+            && self
+                .control
+                .as_ref()
+                .is_some_and(|c| c.paused.load(Ordering::Acquire))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        self.current(generation)
     }
 }
 /// Owns each volume exactly once. Only bounded hydrated rows cross to the UI.
@@ -161,7 +193,65 @@ struct Loaded {
 }
 impl Engine {
     pub fn new() -> Self {
+        Self::local(None)
+    }
+    pub fn new_live(
+        root: PathBuf,
+        _roots: Vec<PathBuf>,
+        control: Arc<crate::live::Control>,
+    ) -> Self {
+        Self::local(Some((root, control)))
+    }
+    pub fn remote(root: PathBuf) -> Self {
         let mailbox = Arc::new(Mailbox::default());
+        let worker = mailbox.clone();
+        let (tx, rx) = async_channel::bounded(8);
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let mut stream = crate::worker::connect_or_start(&root)?;
+                let mut reader = stream.try_clone()?;
+                let replies = tx.clone();
+                let status_root = root.clone();
+                std::thread::spawn(move || {
+                    while let Ok(event) = crate::worker::receive::<Event>(&mut reader) {
+                        if replies.send_blocking(event).is_err() {
+                            break;
+                        }
+                    }
+                    let mut status = crate::worker::runtime(&status_root);
+                    status.running = false;
+                    status.phase = "Stopped".into();
+                    let _ = replies.send_blocking(Event::Runtime(status));
+                });
+                while let Some(request) = worker.take() {
+                    let rpc = match request {
+                        Request::Current { generation } => crate::worker::Rpc::Current(generation),
+                        other => crate::worker::Rpc::Request(other),
+                    };
+                    crate::worker::send(&mut stream, &rpc)?;
+                }
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = tx.send_blocking(Event::Runtime(crate::worker::Runtime {
+                    running: false,
+                    error: Some(format!("{error:#}")),
+                    phase: "Worker unavailable".into(),
+                    ..Default::default()
+                }));
+            }
+        });
+        Self {
+            mailbox,
+            events: rx,
+        }
+    }
+    fn local(live: Option<(PathBuf, Arc<crate::live::Control>)>) -> Self {
+        let mailbox = Arc::new(Mailbox {
+            control: live.as_ref().map(|(_, c)| c.clone()),
+            ..Default::default()
+        });
         let worker = mailbox.clone();
         let (tx, rx) = async_channel::bounded(1);
         let drain = rx.clone();
@@ -171,7 +261,35 @@ impl Engine {
                 let reply = (&tx, &drain);
                 let mut next = worker.take();
                 while let Some(request) = next {
+                    if matches!(&request,Request::Open{..}|Request::ScanFolder{..}|Request::ScanComputer{..}) {worker.loading.store(true,Ordering::Release);}
+                    let session_live = live
+                        .as_ref()
+                        .filter(|(root, _)| match &request {
+                            Request::Open { path, .. } => path.starts_with(root),
+                            Request::ScanFolder { output, .. } => output.starts_with(root),
+                            Request::ScanComputer { directory, .. } => directory.starts_with(root),
+                            _ => false,
+                        })
+                        .cloned();
                     let start = Instant::now();
+                    let priority = live
+                        .as_ref()
+                        .map(|_| crate::live::BackgroundPriority::begin());
+                    let watch_roots = match &request {
+                        Request::ScanComputer { roots, .. } => roots.clone(),
+                        Request::ScanFolder { root, .. } => vec![root.clone()],
+                        _ => vec![],
+                    };
+                    let mut watch = session_live.as_ref().and_then(|(exclude, _)| {
+                        crate::live::LiveWatch::new(
+                            &watch_roots
+                                .iter()
+                                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+                                .collect::<Vec<_>>(),
+                            exclude.clone(),
+                        )
+                        .ok()
+                    });
                     let (generation, search, loaded) = match request {
                         Request::Open {
                             path,
@@ -213,116 +331,275 @@ impl Engine {
                             );
                             (generation, search, loaded)
                         }
-                        Request::Search { .. } | Request::Cancel => {
-                            next = worker.take();
-                            continue;
+                        Request::Search {generation,..} | Request::Current {generation} => {
+                            if worker.current(generation) {send_latest(Event::Error{generation,message:"No index is loaded. Choose drives or resume indexing in Settings.".into()},reply);}
+                            next=worker.take();continue;
                         }
+                        Request::Cancel=>{next=worker.take();continue;}
                     };
+                    drop(priority);
                     match loaded {
-                        Ok(loaded) => {
+                        Ok(mut loaded) => {
                             if !worker.current(generation) {
                                 next = worker.take();
                                 continue;
+                            }
+                            if let Some((exclude, _)) = &live
+                                && watch_roots.is_empty()
+                            {
+                                watch = crate::live::LiveWatch::new(
+                                    &loaded
+                                        .indexes
+                                        .iter()
+                                        .map(|i| PathBuf::from(&i.metadata.root))
+                                        .collect::<Vec<_>>(),
+                                    exclude.clone(),
+                                )
+                                .ok();
                             }
                             let load_ms = start.elapsed().as_secs_f64() * 1000.;
-                            let start = Instant::now();
-                            let mut prepared = Vec::with_capacity(loaded.indexes.len());
-                            let mut cache_states = Vec::new();
-                            for (index, path) in loaded.indexes.iter().zip(&loaded.paths) {
-                                if !worker.current(generation) {
-                                    break;
-                                }
-                                progress(
-                                    generation,
-                                    index.entries.len() as u64,
-                                    format!("Preparing search · {}", index.metadata.root),
-                                    reply,
-                                );
-                                let (search, cache) = SearchIndex::prepare(index, path, true);
-                                prepared.push(search);
-                                cache_states.push(cache.state);
-                            }
-                            if !worker.current(generation) {
-                                next = worker.take();
-                                continue;
-                            }
-                            let mut info = SourceInfo {
-                                path: loaded.path,
-                                root: if loaded.indexes.len() == 1 {
-                                    loaded.indexes[0].metadata.root.clone()
+                            let mut retained: Option<Vec<rustsearch_query::SearchTables>> = None;
+                            let mut active_generation = generation;
+                            let mut active_search = search;
+                            let mut last_refresh = Instant::now();
+                            'session: loop {
+                                let start = Instant::now();
+                                let mut prepared = Vec::new();
+                                let mut cache_states = vec![];
+                                if let Some(tables) = retained.take() {
+                                    for (table, index) in tables.into_iter().zip(&loaded.indexes) {
+                                        prepared.push(
+                                            table.attach(index).expect("unchanged search base"),
+                                        );
+                                    }
+                                    cache_states.push("live");
                                 } else {
-                                    "This computer".into()
-                                },
-                                backend: if loaded.indexes.len() == 1 {
-                                    loaded.indexes[0].metadata.source.clone()
-                                } else {
-                                    "multi-volume".into()
-                                },
-                                records: 0,
-                                files: 0,
-                                folders: 0,
-                                sized_files: 0,
-                                pending: 0,
-                                sequence: 0,
-                                memory_bytes: 0,
-                                load_ms,
-                                prepare_ms: start.elapsed().as_secs_f64() * 1000.,
-                                cache_state: if cache_states.iter().all(|s| *s == "hit") {
-                                    "hit".into()
-                                } else {
-                                    cache_states.join(", ")
-                                },
-                                volumes: vec![],
-                                warnings: loaded.warnings,
-                            };
-                            for (index, search) in loaded.indexes.iter().zip(&prepared) {
-                                let (records, folders, sized, _) = index.counts();
-                                info.records += records;
-                                info.files += records - folders;
-                                info.folders += folders;
-                                info.sized_files += sized;
-                                info.pending += index.metadata.pending_refresh.len();
-                                info.sequence = info.sequence.max(index.log_sequence);
-                                info.memory_bytes +=
-                                    index.allocated_bytes() + search.allocated_bytes();
-                                info.volumes.push(VolumeSummary {
-                                    root: index.metadata.root.clone(),
-                                    records,
-                                    sequence: index.log_sequence,
-                                    skipped: index.metadata.skipped_entries,
-                                    reparse: index.metadata.reparse_points_not_followed,
-                                });
-                            }
-                            let info = Arc::new(info);
-                            respond(
-                                &loaded.indexes,
-                                &prepared,
-                                info.clone(),
-                                generation,
-                                search,
-                                &worker,
-                                reply,
-                            );
-                            loop {
-                                match worker.take() {
-                                    Some(Request::Search { generation, search }) => respond(
-                                        &loaded.indexes,
-                                        &prepared,
-                                        info.clone(),
-                                        generation,
-                                        search,
-                                        &worker,
-                                        reply,
-                                    ),
-                                    other => {
-                                        next = other;
-                                        break;
+                                    for (index, path) in loaded.indexes.iter().zip(&loaded.paths) {
+                                        if !worker.current(active_generation) {
+                                            next = worker.take();
+                                            break 'session;
+                                        }
+                                        progress(
+                                            active_generation,
+                                            index.entries.len() as u64,
+                                            format!("Preparing search · {}", index.metadata.root),
+                                            reply,
+                                        );
+                                        let (table, cache) =
+                                            SearchIndex::prepare(index, path, true);
+                                        prepared.push(table);
+                                        cache_states.push(cache.state);
                                     }
                                 }
+                                let mut info = SourceInfo {
+                                    path: loaded.path.clone(),
+                                    root: if loaded.indexes.len() == 1 {
+                                        loaded.indexes[0].metadata.root.clone()
+                                    } else {
+                                        "This computer".into()
+                                    },
+                                    backend: if loaded.indexes.len() == 1 {
+                                        loaded.indexes[0].metadata.source.clone()
+                                    } else {
+                                        "multi-volume".into()
+                                    },
+                                    records: 0,
+                                    files: 0,
+                                    folders: 0,
+                                    sized_files: 0,
+                                    pending: 0,
+                                    sequence: 0,
+                                    memory_bytes: 0,
+                                    load_ms,
+                                    prepare_ms: start.elapsed().as_secs_f64() * 1000.,
+                                    cache_state: if cache_states.iter().all(|s| *s == "hit") {
+                                        "hit".into()
+                                    } else {
+                                        cache_states.join(", ")
+                                    },
+                                    volumes: vec![],
+                                    warnings: loaded.warnings.clone(),
+                                    live: session_live.is_some(),
+                                };
+                                if let Some(watch) = &watch {
+                                    info.warnings.extend(watch.errors.clone());
+                                }
+                                for (index, table) in loaded.indexes.iter().zip(&prepared) {
+                                    let (records, folders, sized, _) = index.counts();
+                                    info.records += records;
+                                    info.folders += folders;
+                                    info.files += records - folders;
+                                    info.sized_files += sized;
+                                    info.pending += index.metadata.pending_refresh.len();
+                                    info.sequence = info.sequence.max(index.log_sequence);
+                                    info.memory_bytes +=
+                                        index.allocated_bytes() + table.allocated_bytes();
+                                    info.volumes.push(VolumeSummary {
+                                        root: index.metadata.root.clone(),
+                                        records,
+                                        sequence: index.log_sequence,
+                                        skipped: index.metadata.skipped_entries,
+                                        reparse: index.metadata.reparse_points_not_followed,
+                                    });
+                                }
+                                let info = Arc::new(info);
+                                worker.loading.store(false,Ordering::Release);
+                                respond(
+                                    &loaded.indexes,
+                                    &prepared,
+                                    info.clone(),
+                                    active_generation,
+                                    active_search.clone(),
+                                    &worker,
+                                    reply,
+                                );
+                                let events = loop {
+                                    let (stopped, request) = if session_live.is_some() {
+                                        worker.poll()
+                                    } else {
+                                        match worker.take() {
+                                            Some(r) => (false, Some(r)),
+                                            None => (true, None),
+                                        }
+                                    };
+                                    if stopped {
+                                        next = None;
+                                        break 'session;
+                                    }
+                                    match request {
+                                        Some(Request::Search { generation, search }) => {
+                                            worker.generation.store(generation,Ordering::Release);
+                                            active_generation = generation;
+                                            active_search = search;
+                                            respond(
+                                                &loaded.indexes,
+                                                &prepared,
+                                                info.clone(),
+                                                active_generation,
+                                                active_search.clone(),
+                                                &worker,
+                                                reply,
+                                            );
+                                        }
+                                        Some(other) => {
+                                            next = Some(other);
+                                            break 'session;
+                                        }
+                                        None => {
+                                            let Some((_, control)) = &live else {
+                                                continue;
+                                            };
+                                            if control.paused.load(Ordering::Acquire) {
+                                                continue;
+                                            }
+                                            let (events, overflow) = watch
+                                                .as_ref()
+                                                .map_or((vec![], false), |w| w.take());
+                                            let native_due = last_refresh.elapsed()
+                                                >= std::time::Duration::from_secs(2)
+                                                && loaded.indexes.iter().any(|i| {
+                                                    i.metadata.source == "ntfs-usn"
+                                                        || !i.metadata.pending_refresh.is_empty()
+                                                });
+                                            if events.is_empty() && !overflow && !native_due {
+                                                continue;
+                                            }
+                                            break (events, overflow);
+                                        }
+                                    }
+                                };
+                                let tables = prepared
+                                    .into_iter()
+                                    .map(SearchIndex::detach)
+                                    .collect::<Vec<_>>();
+                                let (exclude, control) =
+                                    session_live.as_ref().expect("live updates enabled");
+                                let updated =
+                                    (|| -> Result<Vec<rustsearch_query::SearchTables>> {
+                                        let mut retained_tables = vec![];
+                                        ensure!(!events.1, "filesystem notification overflow");
+                                        for ((index, path), table) in loaded
+                                            .indexes
+                                            .iter_mut()
+                                            .zip(&loaded.paths)
+                                            .zip(tables.into_iter())
+                                        {
+                                            let bound = table.attach(index)?;
+                                            let mut delta = if index.metadata.source == "ntfs-usn" {
+                                                rustsearch_windows::refresh(
+                                                    index,
+                                                    control.sizes.load(Ordering::Acquire),
+                                                )?
+                                                .0
+                                            } else {
+                                                crate::live::delta(
+                                                    index,
+                                                    &bound,
+                                                    &events.0,
+                                                    control.sizes.load(Ordering::Acquire),
+                                                    exclude,
+                                                )?
+                                            };
+                                            if index.metadata.source == "ntfs-usn" {
+                                                crate::live::exclude_native_storage(
+                                                    index, &mut delta, exclude,
+                                                );
+                                            }
+                                            let table = bound.detach();
+                                            if delta.records.is_empty()
+                                                && (index.metadata.source == "ntfs-usn"
+                                                    || delta.metadata.checkpoint
+                                                        == index.metadata.checkpoint)
+                                                && delta.metadata.pending_refresh
+                                                    == index.metadata.pending_refresh
+                                            {
+                                                retained_tables.push(table);
+                                                continue;
+                                            }
+                                            let guard =
+                                                rustsearch_storage::WriteGuard::acquire(path)?;
+                                            rustsearch_storage::append_delta(
+                                                &guard, index, &delta,
+                                            )?;
+                                            index.apply_delta(delta)?;
+                                            retained_tables.push(table);
+                                        }
+                                        Ok(retained_tables)
+                                    })();
+                                last_refresh = Instant::now();
+                                let tables = match updated {
+                                    Ok(tables) => tables,
+                                    Err(error) => {
+                                        worker.loading.store(true,Ordering::Release);
+                                        progress(
+                                            active_generation,
+                                            0,
+                                            format!("Reconciling after {error:#}"),
+                                            reply,
+                                        );
+                                        next = Some(Request::ScanComputer {
+                                            roots: loaded
+                                                .indexes
+                                                .iter()
+                                                .map(|i| PathBuf::from(&i.metadata.root))
+                                                .collect(),
+                                            directory: exclude.join(format!(
+                                                "managed-{}",
+                                                crate::worker::now_ms()
+                                            )),
+                                            mode: if loaded.indexes.iter().all(|i|i.metadata.source=="ntfs-usn"){ScanMode::Native}else{ScanMode::Accessible},
+                                            sizes: control.sizes.load(Ordering::Acquire),
+                                            generation: active_generation,
+                                            search: active_search.clone(),
+                                        });
+                                        break 'session;
+                                    }
+                                };
+                                retained = Some(tables);
                             }
-                            // Borrowing search tables drop before their source indexes, then the next source loads.
                         }
                         Err(error) => {
+                            worker.loading.store(false,Ordering::Release);
                             if worker.current(generation) {
                                 send_latest(
                                     Event::Error {
@@ -344,7 +621,11 @@ impl Engine {
         }
     }
     pub fn submit(&self, request: Request, generation: u64) {
-        self.mailbox.generation.store(generation, Ordering::Release);
+        if !matches!(&request, Request::Search { .. })
+            || !self.mailbox.loading.load(Ordering::Acquire)
+        {
+            self.mailbox.generation.store(generation, Ordering::Release);
+        }
         self.mailbox
             .pending
             .lock()
@@ -425,7 +706,7 @@ fn scan_folder(
     let mut pulse = Instant::now();
     progress(generation, 0, format!("Scanning {}", root.display()), reply);
     let (mut index, _) = rustsearch_windows::walk_controlled(root, sizes, |records| {
-        if !mailbox.current(generation) {
+        if !mailbox.scanning(generation) {
             return false;
         }
         if pulse.elapsed().as_millis() >= 200 {
@@ -492,7 +773,7 @@ fn scan_computer(
                     text,
                     sizes.then_some(usize::MAX),
                     |records| {
-                        if !mailbox.current(generation) {
+                        if !mailbox.scanning(generation) {
                             return false;
                         }
                         if pulse.elapsed().as_millis() >= 200 {
@@ -591,6 +872,7 @@ fn respond(
     }
     let query_ms = start.elapsed().as_secs_f64() * 1000.;
     let mut rows = Vec::with_capacity(candidates.len());
+    let mut path_bytes = 0usize;
     for (source_ix, id, _) in candidates {
         if !mailbox.current(generation) {
             return;
@@ -610,6 +892,11 @@ fn respond(
             })
             .unwrap_or_else(|| "Unresolved parent".into());
         let path_error = path.as_ref().err().map(ToString::to_string);
+        let bytes = name.len() * 2 + location.len() + path.as_ref().map_or(0, |p| p.len() * 2);
+        if path_bytes + bytes > 4 * 1024 * 1024 {
+            break;
+        }
+        path_bytes += bytes;
         rows.push(Row {
             id,
             source: source_ix,

@@ -5,7 +5,7 @@ use gpui::{
     relative, uniform_list,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Sizable, TitleBar,
+    Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -49,10 +49,7 @@ impl Default for Settings {
     }
 }
 pub fn data_directory() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("RustSearch")
+    rustsearch_desktop::worker::data_directory()
 }
 impl Settings {
     pub fn load() -> Self {
@@ -77,6 +74,7 @@ enum Page {
     Largest,
     Overview,
     Computer,
+    Settings,
 }
 
 struct DriveChoice {
@@ -118,6 +116,10 @@ pub struct Workspace {
     query_ms: f64,
     error: Option<String>,
     notice: Option<String>,
+    runtime: Option<rustsearch_desktop::worker::Runtime>,
+    settings_busy: bool,
+    engine_epoch: u64,
+    engine_remote: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -125,6 +127,7 @@ impl Workspace {
     pub fn new(
         settings: Settings,
         initial: Option<PathBuf>,
+        background: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -157,11 +160,22 @@ impl Workspace {
                 }
             }),
         ];
-        let engine = Engine::new();
+        let engine = if background {
+            Engine::remote(data_directory())
+        } else {
+            Engine::new()
+        };
         let events = engine.events.clone();
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
-                if this.update(cx, |this, cx| this.receive(event, cx)).is_err() {
+                if this
+                    .update(cx, |this, cx| {
+                        if this.engine_epoch == 1 {
+                            this.receive(event, cx);
+                        }
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -201,10 +215,22 @@ impl Workspace {
             query_ms: 0.,
             error: None,
             notice: None,
+            runtime: background.then(|| rustsearch_desktop::worker::Runtime {
+                phase: "Connecting".into(),
+                ..Default::default()
+            }),
+            settings_busy: false,
+            engine_epoch: 1,
+            engine_remote: background,
             _subscriptions: subscriptions,
         };
         view.search.update(cx, |s, cx| s.focus(window, cx));
-        if let Some(path) = initial {
+        if background {
+            view.generation = 1;
+            view.busy = true;
+            view.busy_label = "Connecting to background indexer".into();
+            view.engine.submit(Request::Current { generation: 1 }, 1);
+        } else if let Some(path) = initial {
             view.open_source(path, cx);
         }
         view
@@ -212,10 +238,126 @@ impl Workspace {
     fn palette(&self) -> Palette {
         Palette::new(self.settings.dark)
     }
-    fn show_computer(&mut self, cx: &mut Context<Self>) {
-        if self.busy && self.source.is_none() {
+    fn refresh_runtime(&mut self, cx: &mut Context<Self>) {
+        self.runtime_command(rustsearch_desktop::worker::Rpc::Status, false, cx);
+    }
+    fn runtime_command(
+        &mut self,
+        command: rustsearch_desktop::worker::Rpc,
+        start: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_busy {
             return;
         }
+        self.settings_busy = true;
+        let root = data_directory();
+        let task = cx
+            .background_executor()
+            .spawn(async move { rustsearch_desktop::worker::command_state(&root, command, start) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.settings_busy = false;
+                match result {
+                    Ok(state) => {
+                        this.runtime = Some(state);
+                    }
+                    Err(error) => {
+                        let mut state = rustsearch_desktop::worker::runtime(&data_directory());
+                        state.running = false;
+                        state.phase = "Stopped".into();
+                        if start {
+                            state.error = Some(format!("{error:#}"));
+                        }
+                        this.runtime = Some(state);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn attach_engine(&mut self, engine: Engine, remote: bool, cx: &mut Context<Self>) {
+        self.engine_epoch += 1;
+        let epoch = self.engine_epoch;
+        self.engine = engine;
+        self.engine_remote = remote;
+        let events = self.engine.events.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        if this.engine_epoch == epoch {
+                            this.receive(event, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    fn start_worker(&mut self, cx: &mut Context<Self>) {
+        self.attach_engine(Engine::remote(data_directory()), true, cx);
+        self.generation += 1;
+        self.busy = true;
+        self.busy_label = "Connecting to background indexer".into();
+        self.runtime = Some(rustsearch_desktop::worker::Runtime {
+            phase: "Connecting".into(),
+            ..Default::default()
+        });
+        self.engine.submit(
+            Request::Current {
+                generation: self.generation,
+            },
+            self.generation,
+        );
+        cx.notify();
+    }
+    fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.palette();
+        let state = self
+            .runtime
+            .clone()
+            .unwrap_or_else(|| rustsearch_desktop::worker::runtime(&data_directory()));
+        let profile = state.profile.clone();
+        let running = state.running;
+        let paused = profile.paused;
+        let background = profile.background;
+        let automatic = profile.auto_index;
+        let startup = profile.start_at_login;
+        let sizes = profile.sizes;
+        div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll().p_6().flex().flex_col().gap_5()
+            .child(div().text_size(px(25.)).font_weight(gpui::FontWeight::SEMIBOLD).child("Open. Search. Keep everything current."))
+            .child(div().text_size(px(13.)).text_color(p.muted).child("Your index runs in a separate process under your Windows account. Closing this window keeps background indexing running when enabled."))
+            .child(div().p_5().rounded(px(8.)).border_1().border_color(p.border).bg(p.surface).flex().flex_col().gap_3()
+                .child(div().flex().items_center().gap_3().child(Icon::new(if running {IconName::CircleCheck}else{IconName::CircleX}).size(px(20.)).text_color(if running {p.accent}else{p.warning}))
+                    .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(if running {if paused {"Background indexing paused"}else{"Background indexer running"}}else{"Background indexer stopped"})))
+                .child(div().text_size(px(12.)).text_color(p.muted).child(state.phase.clone()))
+                .when_some(state.error.clone(),|d,error|d.child(div().text_size(px(12.)).text_color(p.warning).child(error)))
+                .child(div().flex().gap_3()
+                    .child(Button::new("worker-start").primary().small().label("Start indexer").disabled(running||self.settings_busy).on_click(cx.listener(|this,_,_,cx|this.start_worker(cx))))
+                    .child(Button::new("worker-pause").outline().small().label(if paused {"Resume"}else{"Pause"}).disabled(!running||self.settings_busy).on_click(cx.listener(move |this,_,_,cx|{let mut config=this.runtime.as_ref().map(|s|s.profile.clone()).unwrap_or_default();config.paused= !paused;this.runtime_command(rustsearch_desktop::worker::Rpc::Configure(config),true,cx);})))
+                    .child(Button::new("worker-stop").ghost().small().label("Stop indexer").disabled(!running||self.settings_busy).on_click(cx.listener(|this,_,_,cx|this.runtime_command(rustsearch_desktop::worker::Rpc::Stop,false,cx))))
+                    .child(Button::new("worker-status").ghost().small().icon(IconName::Redo).label("Refresh status").disabled(self.settings_busy).on_click(cx.listener(|this,_,_,cx|this.refresh_runtime(cx))))))
+            .child(div().p_5().rounded(px(8.)).border_1().border_color(p.border).bg(p.surface).flex().flex_col().gap_3()
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("STARTUP & BACKGROUND"))
+                .child(Button::new("setting-auto").ghost().icon(if automatic {IconName::Check}else{IconName::Plus}).label("Automatically index drives when the worker starts").disabled(self.settings_busy).on_click(cx.listener(move |this,_,_,cx|{let mut config=this.runtime.as_ref().map(|s|s.profile.clone()).unwrap_or_default();config.auto_index= !automatic;this.runtime_command(rustsearch_desktop::worker::Rpc::Configure(config),true,cx);})))
+                .child(Button::new("setting-background").ghost().icon(if background {IconName::Check}else{IconName::Plus}).label("Keep indexing after this window closes").disabled(self.settings_busy).on_click(cx.listener(move |this,_,_,cx|{let mut config=this.runtime.as_ref().map(|s|s.profile.clone()).unwrap_or_default();config.background= !background;this.runtime_command(rustsearch_desktop::worker::Rpc::Configure(config),true,cx);})))
+                .child(Button::new("setting-startup").ghost().icon(if startup {IconName::Check}else{IconName::Plus}).label("Start with Windows (at sign-in)").disabled(self.settings_busy).on_click(cx.listener(move |this,_,_,cx|{let mut config=this.runtime.as_ref().map(|s|s.profile.clone()).unwrap_or_default();config.start_at_login= !startup;this.runtime_command(rustsearch_desktop::worker::Rpc::Configure(config),true,cx);})))
+                .child(Button::new("setting-sizes").ghost().icon(if sizes {IconName::Check}else{IconName::Plus}).label("Collect logical sizes for Largest files").disabled(self.settings_busy).on_click(cx.listener(move |this,_,_,cx|{let mut config=this.runtime.as_ref().map(|s|s.profile.clone()).unwrap_or_default();config.sizes= !sizes;this.runtime_command(rustsearch_desktop::worker::Rpc::Configure(config),true,cx);})))
+                .child(div().text_size(px(11.)).text_color(p.muted).child("No administrator installation. Startup opens the background worker without a window. Size collection applies to future scans and changed files; rebuild to fill previously unknown sizes.")))
+            .child(div().p_5().rounded(px(8.)).border_1().border_color(p.border).bg(p.surface).flex().flex_col().gap_3()
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("SCOPE & FRESHNESS"))
+                .child(div().text_size(px(12.)).text_color(p.muted).child(format!("{} configured locations. Accessible indexing respects your account's permissions and does not follow reparse targets.",profile.roots.len())))
+                .child(Button::new("settings-scope").outline().small().icon(IconName::Folder).label("Choose drives or rebuild index").on_click(cx.listener(|this,_,_,cx|this.show_computer(cx))))
+                .child(div().text_size(px(11.)).text_color(p.muted).child("Native change notifications update the current index. A watcher gap or overflow requires reconciliation; an accessible index is rescanned after worker downtime. RustSearch's own index storage is excluded from change monitoring.")))
+    }
+    fn show_computer(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Computer;
         if self.discovering {
             return;
@@ -233,7 +375,27 @@ impl Workspace {
                         this.drives = drives
                             .into_iter()
                             .map(|drive| {
-                                let selected = drive.error.is_none() && !drive.removable;
+                                let old = this
+                                    .drives
+                                    .iter()
+                                    .find(|d| d.drive.root == drive.root)
+                                    .map(|d| d.selected);
+                                let configured = this.runtime.as_ref().map(|s| &s.profile.roots);
+                                let selected = drive.error.is_none()
+                                    && old.unwrap_or_else(|| {
+                                        configured.filter(|r| !r.is_empty()).map_or(
+                                            !drive.removable,
+                                            |roots| {
+                                                roots.iter().any(|p| {
+                                                    display_path(&p.to_string_lossy())
+                                                        .trim_end_matches('\\')
+                                                        .eq_ignore_ascii_case(
+                                                            drive.root.trim_end_matches('\\'),
+                                                        )
+                                                })
+                                            },
+                                        )
+                                    });
                                 DriveChoice { drive, selected }
                             })
                             .collect()
@@ -247,9 +409,6 @@ impl Workspace {
         cx.notify();
     }
     fn start_computer(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
         let selected: Vec<_> = self
             .drives
             .iter()
@@ -277,6 +436,9 @@ impl Workspace {
             .as_millis();
         let directory = data_directory().join(format!("computer-{stamp}-{}", std::process::id()));
         self.generation += 1;
+        if !self.engine_remote || self.runtime.as_ref().is_some_and(|s| !s.running) {
+            self.attach_engine(Engine::remote(data_directory()), true, cx);
+        }
         self.source_path = Some(directory.join("computer.rscatalog"));
         self.page = Page::Search;
         self.location = None;
@@ -341,7 +503,7 @@ impl Workspace {
                 .child(Button::new("collect-sizes").ghost().small().icon(if self.collect_sizes { IconName::Check } else { IconName::Plus }).label("Collect logical file sizes for Largest files").on_click(cx.listener(|this, _, _, cx| { this.collect_sizes = !this.collect_sizes; cx.notify(); })))
                 .child(div().text_size(px(11.)).text_color(p.muted).child("Size collection adds disk work. Leave it off for the fastest name index. Unknown sizes remain visible as unknown.")))
             .child(div().flex().items_center().gap_4()
-                .child(Button::new("index-computer").primary().icon(IconName::Search).label(format!("Index {selected} selected drive{}", if selected == 1 { "" } else { "s" })).disabled(selected == 0 || self.busy || self.discovering).on_click(cx.listener(|this, _, _, cx| this.start_computer(cx))))
+                .child(Button::new("index-computer").primary().icon(IconName::Search).label(format!("Index {selected} selected drive{}", if selected == 1 { "" } else { "s" })).disabled(selected == 0 || self.discovering).on_click(cx.listener(|this, _, _, cx| this.start_computer(cx))))
                 .child(Button::new("computer-folder").ghost().label("Choose a folder instead").on_click(cx.listener(|this, _, _, cx| this.prompt(true, cx)))))
             .child(div().text_size(px(11.)).text_color(p.muted).child("Local drive letters only. Network shares, unmounted volumes, locked drives, and reparse targets are excluded. Skips and failures stay visible in the index overview. Disk bars show volume capacity, not indexed folder totals."))
     }
@@ -358,6 +520,9 @@ impl Workspace {
         }
     }
     fn open_source(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.engine_remote && !path.starts_with(data_directory()) {
+            self.attach_engine(Engine::new(), false, cx);
+        }
         self.generation += 1;
         self.busy = true;
         self.error = None;
@@ -400,11 +565,23 @@ impl Workspace {
     }
     fn receive(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
+            Event::Runtime(state) => {
+                if !state.running {
+                    self.busy = false;
+                }
+                self.runtime = Some(state);
+            }
             Event::Progress {
                 generation,
                 records,
                 stage,
             } if generation == self.generation => {
+                if stage.starts_with("Reconciling after") {
+                    self.source = None;
+                    self.rows.clear();
+                    self.busy = true;
+                    self.busy_label = "Reconciling index".into();
+                }
                 self.progress = Some(records);
                 self.pending_root = Some(stage);
             }
@@ -461,6 +638,9 @@ impl Workspace {
             {
                 let _ = this.update(cx, |this, cx| {
                     if folder {
+                        if this.engine_remote {
+                            this.attach_engine(Engine::new(), false, cx);
+                        }
                         this.page = Page::Search;
                         this.location = None;
                         this.generation += 1;
@@ -502,7 +682,7 @@ impl Workspace {
         .detach();
     }
     fn open_selected(&mut self, reveal: bool, cx: &mut Context<Self>) {
-        if self.busy || matches!(self.page, Page::Overview | Page::Computer) {
+        if self.busy || matches!(self.page, Page::Overview | Page::Computer | Page::Settings) {
             return;
         }
         if let Some(path) = self.rows.get(self.selected).and_then(|r| r.path.as_ref()) {
@@ -525,7 +705,7 @@ impl Workspace {
         }
     }
     fn copy_selected(&mut self, cx: &mut Context<Self>) {
-        if self.busy || matches!(self.page, Page::Overview | Page::Computer) {
+        if self.busy || matches!(self.page, Page::Overview | Page::Computer | Page::Settings) {
             return;
         }
         if let Some(path) = self.rows.get(self.selected).and_then(|r| r.path.as_ref()) {
@@ -537,7 +717,9 @@ impl Workspace {
         }
     }
     fn move_selection(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rows.is_empty() || self.busy || matches!(self.page, Page::Overview | Page::Computer)
+        if self.rows.is_empty()
+            || self.busy
+            || matches!(self.page, Page::Overview | Page::Computer | Page::Settings)
         {
             return;
         }
@@ -800,7 +982,15 @@ impl Workspace {
                             .text_size(px(10.))
                             .text_color(p.accent)
                             .child(div().size(px(5.)).rounded_full().bg(p.accent))
-                            .child("Snapshot loaded"),
+                            .child(if source.live {
+                                if self.runtime.as_ref().is_some_and(|s| s.profile.paused) {
+                                    "Updates paused"
+                                } else {
+                                    "Live updates"
+                                }
+                            } else {
+                                "Snapshot loaded"
+                            }),
                     )
                     .into_any_element()
             } else {
@@ -823,6 +1013,21 @@ impl Workspace {
                 ),
             )
             .child(div().flex_1())
+            .child(
+                div().px_2().pb_2().child(
+                    self.nav(
+                        "nav-settings",
+                        IconName::Settings,
+                        "Settings",
+                        self.page == Page::Settings,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page = Page::Settings;
+                        this.refresh_runtime(cx);
+                        cx.notify();
+                    })),
+                ),
+            )
             .child(
                 div().px_2().pb_2().child(
                     self.nav(
@@ -910,20 +1115,31 @@ impl Workspace {
                                         Page::Largest => "Largest files",
                                         Page::Overview => "Index overview",
                                         Page::Computer => "This computer",
+                                        Page::Settings => "Settings",
                                     }),
                             )
-                            .when(self.source.is_some() && self.page != Page::Computer, |d| {
-                                d.child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded(px(4.))
-                                        .bg(p.raised)
-                                        .text_size(px(10.))
-                                        .text_color(p.muted)
-                                        .child("LOCAL SNAPSHOT"),
-                                )
-                            }),
+                            .when(
+                                self.source.is_some()
+                                    && !matches!(self.page, Page::Computer | Page::Settings),
+                                |d| {
+                                    d.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(px(4.))
+                                            .bg(p.raised)
+                                            .text_size(px(10.))
+                                            .text_color(p.muted)
+                                            .child(
+                                                if self.source.as_ref().is_some_and(|s| s.live) {
+                                                    "LIVE INDEX"
+                                                } else {
+                                                    "READ-ONLY SNAPSHOT"
+                                                },
+                                            ),
+                                    )
+                                },
+                            ),
                     )
                     .child(
                         div()
@@ -936,7 +1152,7 @@ impl Workspace {
                                         .small()
                                         .icon(IconName::Search)
                                         .label(format!(
-                                            "Index {} drives",
+                                            "Index drives ({})",
                                             self.drives
                                                 .iter()
                                                 .filter(|d| d.selected && d.drive.error.is_none())
@@ -944,7 +1160,6 @@ impl Workspace {
                                         ))
                                         .disabled(
                                             self.discovering
-                                                || self.busy
                                                 || !self
                                                     .drives
                                                     .iter()
@@ -953,6 +1168,15 @@ impl Workspace {
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.start_computer(cx)),
                                         ),
+                                )
+                            })
+                            .when(self.busy && self.source.is_none(), |d| {
+                                d.child(
+                                    Button::new("cancel-toolbar")
+                                        .ghost()
+                                        .small()
+                                        .label("Cancel scan")
+                                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                                 )
                             })
                             .child(
@@ -992,7 +1216,11 @@ impl Workspace {
                                 .text_color(p.accent),
                         )
                         .cleanable(true)
-                        .disabled(self.source.is_none()),
+                        .disabled(
+                            self.source.is_none()
+                                || (self.engine_remote
+                                    && self.runtime.as_ref().is_some_and(|s| !s.running)),
+                        ),
                 )
                 .child(
                     div()
@@ -1008,7 +1236,11 @@ impl Workspace {
                                     Mode::Prefix => "Starts with ▾",
                                     Mode::Exact => "Exact name ▾",
                                 })
-                                .disabled(self.source.is_none())
+                                .disabled(
+                                    self.source.is_none()
+                                        || (self.engine_remote
+                                            && self.runtime.as_ref().is_some_and(|s| !s.running)),
+                                )
                                 .dropdown_menu(move |mut menu, _, _| {
                                     for (label, mode, tag) in [
                                         ("Contains", Mode::Contains, 0),
@@ -1031,13 +1263,13 @@ impl Workspace {
                                 }),
                         )
                         .child(div().h(px(18.)).border_r_1().border_color(p.border))
-                        .child(
-                            div().w(px(145.)).child(
-                                Input::new(&self.extension)
-                                    .small()
-                                    .disabled(self.source.is_none()),
+                        .child(div().w(px(145.)).child(
+                            Input::new(&self.extension).small().disabled(
+                                self.source.is_none()
+                                    || (self.engine_remote
+                                        && self.runtime.as_ref().is_some_and(|s| !s.running)),
                             ),
-                        )
+                        ))
                         .child(
                             Button::new("minimum-size")
                                 .ghost()
@@ -1048,7 +1280,11 @@ impl Workspace {
                                     Some(104_857_600) => "≥ 100 MiB ▾",
                                     _ => "≥ 1 GiB ▾",
                                 })
-                                .disabled(self.source.is_none())
+                                .disabled(
+                                    self.source.is_none()
+                                        || (self.engine_remote
+                                            && self.runtime.as_ref().is_some_and(|s| !s.running)),
+                                )
                                 .dropdown_menu(move |mut menu, _, _| {
                                     for (label, value) in [
                                         ("Any size", None),
@@ -1250,30 +1486,27 @@ impl Workspace {
                 .flex_1()
                 .into_any_element()
             })
-            .when(
-                self.rows.len() < self.total && self.rows.len() < 10_000,
-                |d| {
-                    d.child(
-                        div()
-                            .py_2()
-                            .flex()
-                            .justify_center()
-                            .border_t_1()
-                            .border_color(p.border)
-                            .child(
-                                Button::new("load-more")
-                                    .ghost()
-                                    .small()
-                                    .label("Show 500 more results")
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.limit = (this.limit + 500).min(10_000);
-                                        this.submit(cx);
-                                    })),
-                            ),
-                    )
-                },
-            )
+            .when(self.rows.len() < self.total && self.limit < 10_000, |d| {
+                d.child(
+                    div()
+                        .py_2()
+                        .flex()
+                        .justify_center()
+                        .border_t_1()
+                        .border_color(p.border)
+                        .child(
+                            Button::new("load-more")
+                                .ghost()
+                                .small()
+                                .label("Show 500 more results")
+                                .disabled(self.busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.limit = (this.limit + 500).min(10_000);
+                                    this.submit(cx);
+                                })),
+                        ),
+                )
+            })
             .into_any_element()
     }
     fn result_row(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1396,7 +1629,7 @@ impl Workspace {
         };
         div().flex_1().id("overview-scroll").overflow_y_scroll().p_6().flex().flex_col().gap_6()
             .child(div().text_size(px(23.)).font_weight(gpui::FontWeight::SEMIBOLD).child("One index. A clear view."))
-            .child(div().text_color(p.muted).text_size(px(13.)).child("Search uses a point-in-time metadata snapshot. Reload after an external refresh to pick up committed changes."))
+            .child(div().text_color(p.muted).text_size(px(13.)).child(if source.live {"The background worker applies observed changes automatically. Pause, startup, and background controls are in Settings."}else{"This snapshot is read-only. Reload after an external refresh to pick up committed changes."}))
             .child(div().flex().gap_4()
                 .child(stat("TOTAL ITEMS", number(source.records), p))
                 .child(stat("FILES", number(source.files), p))
@@ -1487,7 +1720,7 @@ impl Render for Workspace {
             .map_or(0, |s| s.volumes.iter().map(|v| v.skipped).sum());
         let inspector = self.inspector
             && self.source.is_some()
-            && !matches!(self.page, Page::Overview | Page::Computer)
+            && !matches!(self.page, Page::Overview | Page::Computer | Page::Settings)
             && window.viewport_size().width >= px(1080.);
         div()
             .key_context("RustSearch")
@@ -1523,19 +1756,6 @@ impl Render for Workspace {
                 cx.listener(|this, _: &FocusResults, window, _| this.list_focus.focus(window)),
             )
             .child(
-                TitleBar::new().bg(p.sidebar).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_size(px(11.))
-                        .text_color(p.muted)
-                        .child("RustSearch")
-                        .child("·")
-                        .child("Local file search"),
-                ),
-            )
-            .child(
                 div()
                     .flex_1()
                     .min_h_0()
@@ -1548,7 +1768,7 @@ impl Render for Workspace {
                             .flex()
                             .flex_col()
                             .child(self.toolbar(cx))
-                            .when((failed_sources > 0 || skipped_entries > 0) && self.page != Page::Computer, |d| {
+                            .when((failed_sources > 0 || skipped_entries > 0) && !matches!(self.page, Page::Computer | Page::Settings), |d| {
                                 d.child(div().px_5().py_2().bg(p.selected).text_color(p.warning).text_size(px(12.)).flex().items_center().justify_between()
                                     .child(format!("Partial coverage · {failed_sources} failed source(s) · {skipped_entries} skipped entries"))
                                     .child(Button::new("coverage-details").ghost().xsmall().label("Review coverage").on_click(cx.listener(|this, _, _, cx| { this.page = Page::Overview; cx.notify(); }))))
@@ -1583,14 +1803,16 @@ impl Render for Workspace {
                                     .flex()
                                     .flex_col()
                                     .key_context(
-                                        if matches!(self.page, Page::Overview | Page::Computer) {
+                                        if matches!(self.page, Page::Overview | Page::Computer | Page::Settings) {
                                             "RustSearchOverview"
                                         } else {
                                             "RustSearchResults"
                                         },
                                     )
                                     .track_focus(&self.list_focus)
-                                    .child(if self.page == Page::Computer {
+                                    .child(if self.page == Page::Settings {
+                                        self.settings_page(cx).into_any_element()
+                                    } else if self.page == Page::Computer {
                                         self.computer(cx).into_any_element()
                                     } else if self.page == Page::Overview {
                                         self.overview(cx).into_any_element()

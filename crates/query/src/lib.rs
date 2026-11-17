@@ -1,16 +1,16 @@
 use rustsearch_core::{DIRECTORY, Index, SIZE_KNOWN};
 use std::collections::BinaryHeap;
 mod prepared;
-pub use prepared::{CacheStats, SearchIndex, cache_path};
+pub use prepared::{CacheStats, SearchIndex, SearchTables, cache_path};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     #[default]
     Contains,
     Prefix,
     Exact,
 }
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     #[default]
     Any,
@@ -150,6 +150,80 @@ mod tests {
         }
         i.finish().unwrap();
         i
+    }
+    #[test]
+    fn detached_tables_rebind_live_deltas_and_reject_another_base() {
+        let mut index = fixture();
+        index.snapshot_identity = Some([7; 24]);
+        let search = SearchIndex::build(&index);
+        assert_eq!(
+            search
+                .child(1, &"Report.PDF".encode_utf16().collect::<Vec<_>>())
+                .unwrap()
+                .id,
+            2
+        );
+        let memory = search.allocated_bytes();
+        let tables = search.detach();
+        index
+            .apply_delta(rustsearch_core::Delta {
+                previous_sequence: 0,
+                previous_checkpoint: None,
+                metadata: index.metadata.clone(),
+                records: std::collections::BTreeMap::from([
+                    (
+                        2,
+                        Some(Record {
+                            id: 2,
+                            parent: 1,
+                            usn: 1,
+                            size: Some(999),
+                            flags: 0,
+                            name: "Renamed.txt".encode_utf16().collect(),
+                        }),
+                    ),
+                    (3, None),
+                ]),
+            })
+            .unwrap();
+        let search = tables.attach(&index).unwrap();
+        assert!(
+            search
+                .child(1, &"Report.PDF".encode_utf16().collect::<Vec<_>>())
+                .is_some_and(|e| e.id == 5)
+        );
+        assert_eq!(
+            search
+                .child(1, &"Renamed.txt".encode_utf16().collect::<Vec<_>>())
+                .unwrap()
+                .id,
+            2
+        );
+        for query in [
+            Query {
+                text: "report".into(),
+                limit: 100,
+                ..Default::default()
+            },
+            Query {
+                largest: true,
+                limit: 100,
+                ..Default::default()
+            },
+            Query {
+                mode: Mode::Exact,
+                text: "Renamed.txt".into(),
+                limit: 100,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(search.execute(&query), query.execute(&index));
+        }
+        assert!(search.allocated_bytes() < memory + 4096);
+        let tables = search.detach();
+        let mut different = fixture();
+        different.snapshot_identity = Some([8; 24]);
+        assert!(tables.attach(&different).is_err());
     }
     #[test]
     fn combines_filters_and_distinguishes_zero_from_unknown_size() {
