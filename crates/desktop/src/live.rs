@@ -563,6 +563,18 @@ impl Edit<'_> {
         Ok(())
     }
     fn upsert(&mut self, path: &Path, recursive: bool, preferred: Option<u64>) -> Result<()> {
+        self.upsert_observed(path, recursive, preferred, true)
+    }
+    fn refresh_metadata(&mut self, path: &Path) -> Result<()> {
+        self.upsert_observed(path, false, None, false)
+    }
+    fn upsert_observed(
+        &mut self,
+        path: &Path,
+        recursive: bool,
+        preferred: Option<u64>,
+        remove_missing: bool,
+    ) -> Result<()> {
         if !is_within(path, Path::new(&self.index.metadata.root)) {
             return Ok(());
         }
@@ -587,7 +599,13 @@ impl Edit<'_> {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.remove(path);
+                if remove_missing {
+                    self.remove(path);
+                } else if let Some(id) = old {
+                    // A queued write can precede a rename/delete already visible on disk.
+                    // Its structural notification (or loss recovery) owns identity changes.
+                    self.pending.insert(id);
+                }
                 return Ok(());
             }
             Err(_) => {
@@ -751,14 +769,18 @@ pub fn changes(
                     let id = edit.resolve(path);
                     if id.is_none() {
                         recovery.folder(path.parent().unwrap_or(path).to_owned(), false);
-                    } else if id == Some(index.metadata.root_id)
-                        || id
-                            .and_then(|id| edit.record(id))
-                            .is_some_and(|r| r.flags & DIRECTORY != 0)
-                    {
-                        recovery.folder(path.clone(), false);
                     } else {
-                        edit.upsert(path, false, None)?;
+                        let retry = id.is_some_and(|id| edit.pending.contains(&id));
+                        edit.refresh_metadata(path)?;
+                        if let Some(id) = id
+                            && retry
+                            && !edit.pending.contains(&id)
+                            && edit
+                                .record(id)
+                                .is_some_and(|r| r.flags & (DIRECTORY | REPARSE) == DIRECTORY)
+                        {
+                            recovery.folder(path.clone(), true);
+                        }
                     }
                 }
             }
@@ -1075,6 +1097,214 @@ mod tests {
         rustsearch_storage::append_delta(&guard, index, &change).unwrap();
         index.apply_delta(change).unwrap();
     }
+    #[test]
+    fn directory_metadata_retries_pending_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let folder = source.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let (mut index, _) = rustsearch_windows::walk(&source, false).unwrap();
+        let search = SearchIndex::build(&index);
+        let id = search
+            .child(
+                index.metadata.root_id,
+                &"folder".encode_utf16().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .id;
+        drop(search);
+        index.metadata.pending_refresh.push(id);
+        std::fs::create_dir(folder.join("new")).unwrap();
+        std::fs::write(folder.join("new/child.txt"), b"new").unwrap();
+        let search = SearchIndex::build(&index);
+        let update = delta(
+            &index,
+            &search,
+            &[event(EventKind::Modify(ModifyKind::Any), vec![folder])],
+            false,
+            &dir.path().join("excluded"),
+        )
+        .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert!(index.metadata.pending_refresh.is_empty());
+        assert_eq!(index.counts().0, 3);
+        let query = rustsearch_query::Query {
+            text: "child.txt".into(),
+            ..Default::default()
+        };
+        assert_eq!(query.execute(&index).total, 1);
+    }
+
+    #[test]
+    fn directory_metadata_waits_for_the_child_rename_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let parent = source.join("folder");
+        std::fs::create_dir_all(&parent).unwrap();
+        let old = parent.join("old.txt");
+        let new = parent.join("new.txt");
+        std::fs::write(&old, b"original").unwrap();
+        let (mut index, _) = rustsearch_windows::walk(&source, false).unwrap();
+        let search = SearchIndex::build(&index);
+        let folder = search
+            .child(
+                index.metadata.root_id,
+                &"folder".encode_utf16().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .id;
+        let id = search
+            .child(folder, &"old.txt".encode_utf16().collect::<Vec<_>>())
+            .unwrap()
+            .id;
+        std::fs::rename(&old, &new).unwrap();
+        let update = delta(
+            &index,
+            &search,
+            &[event(EventKind::Modify(ModifyKind::Any), vec![parent])],
+            false,
+            &dir.path().join("excluded"),
+        )
+        .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert!(
+            index.get(id).is_some(),
+            "directory metadata must not consume a later child's rename as delete/create"
+        );
+        let search = SearchIndex::build(&index);
+        let update = delta(
+            &index,
+            &search,
+            &[event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                vec![old, new.clone()],
+            )],
+            false,
+            &dir.path().join("excluded"),
+        )
+        .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert_eq!(
+            index.path_utf16(index.get(id).unwrap()).unwrap(),
+            new.canonicalize()
+                .unwrap()
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn queued_metadata_does_not_delete_a_file_before_its_rename_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let old = source.join("old.txt");
+        let new = source.join("new.txt");
+        std::fs::write(&old, b"original").unwrap();
+        let (mut index, _) = rustsearch_windows::walk(&source, false).unwrap();
+        let search = SearchIndex::build(&index);
+        let id = search
+            .child(
+                index.metadata.root_id,
+                &"old.txt".encode_utf16().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .id;
+        std::fs::rename(&old, &new).unwrap();
+        let update = delta(
+            &index,
+            &search,
+            &[event(EventKind::Modify(ModifyKind::Any), vec![old.clone()])],
+            false,
+            &dir.path().join("excluded"),
+        )
+        .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert!(
+            index.get(id).is_some(),
+            "a metadata notification must wait for the queued structural event before deleting identity"
+        );
+        let search = SearchIndex::build(&index);
+        let update = delta(
+            &index,
+            &search,
+            &[event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                vec![old, new.clone()],
+            )],
+            false,
+            &dir.path().join("excluded"),
+        )
+        .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert_eq!(
+            index.path_utf16(index.get(id).unwrap()).unwrap(),
+            new.canonicalize()
+                .unwrap()
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn queued_metadata_before_a_paired_rename_preserves_identity() {
+        for stale_metadata in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            let old = source.join("old.txt");
+            let new = source.join("new.txt");
+            std::fs::write(&old, b"original").unwrap();
+            let (mut index, _) = rustsearch_windows::walk(&source, false).unwrap();
+            let search = SearchIndex::build(&index);
+            let id = search
+                .child(
+                    index.metadata.root_id,
+                    &"old.txt".encode_utf16().collect::<Vec<_>>(),
+                )
+                .unwrap()
+                .id;
+            std::fs::rename(&old, &new).unwrap();
+            let mut events = vec![];
+            if stale_metadata {
+                events.push(event(EventKind::Modify(ModifyKind::Any), vec![old.clone()]));
+            }
+            events.push(event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                vec![old, new.clone()],
+            ));
+            let delta = delta(
+                &index,
+                &search,
+                &events,
+                false,
+                &dir.path().join("excluded"),
+            )
+            .unwrap();
+            drop(search);
+            index.apply_delta(delta).unwrap();
+            let record = index
+                .get(id)
+                .expect("stale old-path metadata must not erase a paired rename's identity");
+            assert_eq!(
+                index.path_utf16(record).unwrap(),
+                new.canonicalize()
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(index.counts().0, 1);
+        }
+    }
+
     #[test]
     fn creates_resizes_moves_unicode_subtrees_and_deletes_without_rewriting_base() {
         let dir = tempfile::tempdir().unwrap();
