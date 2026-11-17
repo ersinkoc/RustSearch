@@ -28,6 +28,8 @@ The [0.0.1 Windows x64 portable alpha](https://github.com/ersinkoc/RustSearch/re
 
 Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates CLI-native snapshots; the desktop has a separate per-user background worker for managed sources. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
 
+Full-drive monitoring has not passed acceptance: the current 0.0.1 worker repeatedly reconciled after notification overflow on the approximately 21.86-million-record C:/D:/E: scope. Snapshot searches passed; full-scope live updates and an idle resource budget remain unaccepted. See the [measured full-drive report](docs/FULL_DRIVE_ACCEPTANCE.md).
+
 ## Build and try
 
 Windows, Rust 1.93+ with the MSVC toolchain, and MSVC C++ build tools are required. Dependencies are pinned in `Cargo.lock`.
@@ -79,6 +81,7 @@ The common one-character substring follow-up reduced the `a` query from 12.04 to
 - [CLI commands and limitations](docs/CLI.md)
 - [Desktop app and shortcuts](docs/DESKTOP.md)
 - [Desktop visual and correctness checks](docs/DESKTOP_RESULTS.md)
+- [Full-drive search, monitoring failure, and resource measurements](docs/FULL_DRIVE_ACCEPTANCE.md)
 - [Product and technical plan](docs/PROJECT_PLAN.md)
 - [Everything baseline and feature gaps](docs/FEATURE_BASELINE.md)
 - [Benchmark protocol and engineering targets](docs/BENCHMARKS.md)

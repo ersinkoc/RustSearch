@@ -100,6 +100,10 @@ The actual C:/D:/E: worker was restarted with its saved size-collection and sign
 
 ![Background indexing settings using generated fixture sources](assets/desktop-background.jpg)
 
+## Full-drive follow-up
+
+The subsequent [full-drive acceptance report](FULL_DRIVE_ACCEPTANCE.md) found repeated notification-overflow reconciliation on the approximately 21.86-million-record C:/D:/E: scope. Published snapshot searches passed, but full-drive live monitoring and an idle resource budget did not pass acceptance. The small-fixture checks above must not be treated as full-machine acceptance.
+
 ## Open upstream dependency alert
 
 GitHub reports [GHSA-38c5-483c-4qqp](https://github.com/becheran/grid/security/advisories/GHSA-38c5-483c-4qqp), a moderate integer-overflow advisory in `grid::Grid::expand_rows`. The desktop dependency chain is GPUI 0.2.2 → pinned Taffy 0.9.0 → grid 0.18.0. The advisory's patched version is grid 1.0.1, outside Taffy's current requirement; replacing it is not a compatible lockfile-only update. No `expand_rows` call was found in the installed Taffy 0.9.0 source, but the dependency alert remains open. This source inspection is not a full security audit. The CLI's default dependency graph does not include this GUI layout stack.
