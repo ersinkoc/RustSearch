@@ -1,5 +1,7 @@
 # Full-drive acceptance — Windows 0.0.1
 
+Follow-up: [overflow recovery and live-update results](OVERFLOW_RECOVERY_RESULTS.md) documents the subsequent source fix. This report preserves the original released binary's failed acceptance result.
+
 Verified on 17 November 2026 on the running Windows x64 release worker, with the GUI closed. Version remains **0.0.1**. This is a runtime verification report; no application code, release tag, or published binary was changed.
 
 **Outcome: snapshot search passes on C:, D:, and E:, but continuous full-drive monitoring fails to settle. Live-update acceptance and a stable idle resource budget are not established.**

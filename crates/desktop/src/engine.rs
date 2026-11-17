@@ -362,6 +362,7 @@ impl Engine {
                             let mut active_generation = generation;
                             let mut active_search = search;
                             let mut last_refresh = Instant::now();
+                            let mut last_watch_stats=None;
                             'session: loop {
                                 let start = Instant::now();
                                 let mut prepared = Vec::new();
@@ -453,7 +454,7 @@ impl Engine {
                                     &worker,
                                     reply,
                                 );
-                                let events = loop {
+                                let pending_deltas = loop {
                                     let (stopped, request) = if session_live.is_some() {
                                         worker.poll()
                                     } else {
@@ -485,28 +486,49 @@ impl Engine {
                                             next = Some(other);
                                             break 'session;
                                         }
-                                        None => {
-                                            let Some((_, control)) = &live else {
-                                                continue;
-                                            };
-                                            if control.paused.load(Ordering::Acquire) {
-                                                continue;
-                                            }
-                                            let (events, overflow) = watch
-                                                .as_ref()
-                                                .map_or((vec![], false), |w| w.take());
-                                            let native_due = last_refresh.elapsed()
-                                                >= std::time::Duration::from_secs(2)
-                                                && loaded.indexes.iter().any(|i| {
-                                                    i.metadata.source == "ntfs-usn"
-                                                        || !i.metadata.pending_refresh.is_empty()
-                                                });
-                                            if events.is_empty() && !overflow && !native_due {
-                                                continue;
-                                            }
-                                            break (events, overflow);
-                                        }
+                                        None => {}
                                     }
+                                    let Some((exclude, control)) = &session_live else {
+                                        continue;
+                                    };
+                                    if control.paused.load(Ordering::Acquire) {
+                                        continue;
+                                    }
+                                    // Live work gets a turn even while queries arrive faster than poll().
+                                    if last_refresh.elapsed() < std::time::Duration::from_millis(250) {continue;}
+                                    let events = watch
+                                        .as_ref()
+                                        .map_or_else(crate::live::Changes::default, |w| w.take());
+                                    if last_watch_stats.as_ref()!=Some(&events.stats) {
+                                        let _=rustsearch_storage::write_derived_atomic(&exclude.join("watch-recovery.json"),|file| {
+                                            serde_json::to_writer_pretty(file,&events.stats)?;Ok(())
+                                        });
+                                        last_watch_stats=Some(events.stats.clone());
+                                    }
+                                    let native_due=last_refresh.elapsed()>=std::time::Duration::from_secs(2)
+                                        && loaded.indexes.iter().any(|i|i.metadata.source=="ntfs-usn");
+                                    if events.is_empty() && !native_due {continue;}
+                                    let changes=(|| -> Result<Vec<Option<rustsearch_core::Delta>>> {
+                                        let mut changes=vec![];
+                                        for (index, bound) in loaded.indexes.iter().zip(&prepared) {
+                                            let mut delta=if index.metadata.source=="ntfs-usn" {
+                                                rustsearch_windows::refresh(index,control.sizes.load(Ordering::Acquire))?.0
+                                            } else {
+                                                crate::live::changes(index,bound,&events.events,&events.folders,control.sizes.load(Ordering::Acquire),exclude)?
+                                            };
+                                            if index.metadata.source=="ntfs-usn" {crate::live::exclude_native_storage(index,&mut delta,exclude);}
+                                            let empty=delta.records.is_empty()
+                                                && (index.metadata.source=="ntfs-usn" || delta.metadata.checkpoint==index.metadata.checkpoint)
+                                                && delta.metadata.pending_refresh==index.metadata.pending_refresh;
+                                            changes.push(if empty {None}else{Some(delta)});
+                                        }
+                                        Ok(changes)
+                                    })();
+                                    last_refresh=Instant::now();
+                                    // Ordinary log/attribute notifications often do not change indexed
+                                    // fields. Keep borrowing the same tables and statistics in that case.
+                                    if changes.as_ref().is_ok_and(|items|items.iter().all(Option::is_none)) {continue;}
+                                    break changes;
                                 };
                                 let tables = prepared
                                     .into_iter()
@@ -517,51 +539,13 @@ impl Engine {
                                 let updated =
                                     (|| -> Result<Vec<rustsearch_query::SearchTables>> {
                                         let mut retained_tables = vec![];
-                                        ensure!(!events.1, "filesystem notification overflow");
-                                        for ((index, path), table) in loaded
-                                            .indexes
-                                            .iter_mut()
-                                            .zip(&loaded.paths)
-                                            .zip(tables.into_iter())
-                                        {
-                                            let bound = table.attach(index)?;
-                                            let mut delta = if index.metadata.source == "ntfs-usn" {
-                                                rustsearch_windows::refresh(
-                                                    index,
-                                                    control.sizes.load(Ordering::Acquire),
-                                                )?
-                                                .0
-                                            } else {
-                                                crate::live::delta(
-                                                    index,
-                                                    &bound,
-                                                    &events.0,
-                                                    control.sizes.load(Ordering::Acquire),
-                                                    exclude,
-                                                )?
-                                            };
-                                            if index.metadata.source == "ntfs-usn" {
-                                                crate::live::exclude_native_storage(
-                                                    index, &mut delta, exclude,
-                                                );
+                                        let deltas=pending_deltas?;
+                                        for (((index,path),table),delta) in loaded.indexes.iter_mut().zip(&loaded.paths).zip(tables).zip(deltas) {
+                                            if let Some(delta)=delta {
+                                                let guard=rustsearch_storage::WriteGuard::acquire(path)?;
+                                                rustsearch_storage::append_delta(&guard,index,&delta)?;
+                                                index.apply_delta(delta)?;
                                             }
-                                            let table = bound.detach();
-                                            if delta.records.is_empty()
-                                                && (index.metadata.source == "ntfs-usn"
-                                                    || delta.metadata.checkpoint
-                                                        == index.metadata.checkpoint)
-                                                && delta.metadata.pending_refresh
-                                                    == index.metadata.pending_refresh
-                                            {
-                                                retained_tables.push(table);
-                                                continue;
-                                            }
-                                            let guard =
-                                                rustsearch_storage::WriteGuard::acquire(path)?;
-                                            rustsearch_storage::append_delta(
-                                                &guard, index, &delta,
-                                            )?;
-                                            index.apply_delta(delta)?;
                                             retained_tables.push(table);
                                         }
                                         Ok(retained_tables)
@@ -570,6 +554,9 @@ impl Engine {
                                 let tables = match updated {
                                     Ok(tables) => tables,
                                     Err(error) => {
+                                        let _=rustsearch_storage::write_derived_atomic(&exclude.join("last-reconciliation.json"),|file| {
+                                            serde_json::to_writer_pretty(file,&serde_json::json!({"at_ms":crate::worker::now_ms(),"reason":format!("{error:#}")}))?;Ok(())
+                                        });
                                         worker.loading.store(true,Ordering::Release);
                                         progress(
                                             active_generation,
@@ -1161,6 +1148,63 @@ mod tests {
             2,
         );
         assert!(matches!(reply(&rx, 2), Event::Error { .. }));
+    }
+
+    #[test]
+    fn frequent_searches_do_not_starve_live_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let data = dir.path().join("data");
+        std::fs::create_dir(&source).unwrap();
+        let control = Arc::new(crate::live::Control::default());
+        control.sizes.store(true, Ordering::Release);
+        let engine = Engine::new_live(data.clone(), vec![source.clone()], control.clone());
+        let rx = replies(&engine);
+        let query = SearchSpec {
+            text: "late.txt".into(),
+            ..search()
+        };
+        engine.submit(
+            Request::ScanFolder {
+                root: source.clone(),
+                output: data.join("source.rsidx"),
+                generation: 1,
+                search: query.clone(),
+            },
+            1,
+        );
+        assert!(matches!(reply(&rx, 1), Event::Results { total: 0, .. }));
+        control.paused.store(true, Ordering::Release);
+        engine.submit(
+            Request::Search {
+                generation: 2,
+                search: query.clone(),
+            },
+            2,
+        );
+        assert!(matches!(reply(&rx, 2), Event::Results { total: 0, .. }));
+        std::fs::write(source.join("late.txt"), b"late").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        control.paused.store(false, Ordering::Release);
+        let mut observed = false;
+        for generation in 3..103 {
+            engine.submit(
+                Request::Search {
+                    generation,
+                    search: query.clone(),
+                },
+                generation,
+            );
+            if matches!(reply(&rx, generation), Event::Results { total: 1, .. }) {
+                observed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            observed,
+            "queries faster than the poll timeout must not block live updates"
+        );
     }
 
     #[test]

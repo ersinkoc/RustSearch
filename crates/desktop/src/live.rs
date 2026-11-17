@@ -1,13 +1,13 @@
 use anyhow::{Context, Result, ensure};
 use notify::{
-    Event, EventKind, RecursiveMode, Watcher,
+    Event, EventKind,
     event::{ModifyKind, RenameMode},
 };
 use rustsearch_core::{DIRECTORY, Delta, Index, REPARSE, Record, SIZE_KNOWN};
 use rustsearch_query::SearchIndex;
 use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
@@ -17,28 +17,92 @@ pub struct Control {
     pub paused: AtomicBool,
     pub sizes: AtomicBool,
 }
+const MAX_EVENTS: usize = 4096;
+const MAX_FOLDERS: usize = 4096;
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WatchStats {
+    pub queue_recoveries: u64,
+    pub backend_losses: u64,
+    pub last_batch_folders: usize,
+}
+#[derive(Default)]
+pub struct Changes {
+    pub events: Vec<Event>,
+    pub folders: Vec<(PathBuf, bool)>,
+    pub stats: WatchStats,
+}
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.folders.is_empty()
+    }
+}
+mod windows_watch;
+
 #[derive(Default)]
 struct Queue {
     events: Vec<Event>,
     modified: HashSet<Vec<PathBuf>>,
+    folders: BTreeMap<PathBuf, bool>,
     overflow: bool,
+    pending_renames: BTreeMap<PathBuf, (Event, std::time::Instant)>,
+    stats: WatchStats,
 }
 impl Queue {
     fn invalidate(&mut self) {
         self.overflow = true;
         self.events.clear();
         self.modified.clear();
+        self.folders.clear();
+        self.pending_renames.clear();
+        self.stats.backend_losses += 1;
     }
-    fn push(&mut self, event: Event) {
-        if event.need_rescan() {
-            self.invalidate();
+    fn folder(&mut self, path: PathBuf, recursive: bool) {
+        if path.ancestors().any(|p| self.folders.get(p) == Some(&true)) {
             return;
         }
+        if recursive {
+            self.folders.retain(|p, _| !p.starts_with(&path));
+        }
+        self.folders
+            .entry(path)
+            .and_modify(|r| *r |= recursive)
+            .or_insert(recursive);
+        while self.folders.len() > MAX_FOLDERS {
+            let old = std::mem::take(&mut self.folders);
+            for (path, _) in old {
+                let parent = path.parent().unwrap_or(&path).to_owned();
+                if parent
+                    .ancestors()
+                    .any(|p| self.folders.get(p) == Some(&true))
+                {
+                    continue;
+                }
+                self.folders.retain(|p, _| !p.starts_with(&parent));
+                self.folders.insert(parent, true);
+            }
+        }
+    }
+    fn fold(&mut self, event: &Event) {
+        for path in &event.paths {
+            self.folder(path.parent().unwrap_or(path).to_owned(), false);
+        }
+    }
+    fn retain(&mut self, event: Event) {
         if self.overflow {
             return;
         }
-        // Re-read final metadata once per path between structural events. A rename,
-        // create or delete is a barrier: updates must never move across it.
+        if !self.folders.is_empty() {
+            self.fold(&event);
+            // Preserve paired rename identity even when neighboring data events coalesce.
+            if matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+            ) && self.events.len() < MAX_EVENTS
+            {
+                self.events.push(event);
+            }
+            return;
+        }
         if matches!(
             event.kind,
             EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_))
@@ -50,16 +114,110 @@ impl Queue {
         } else {
             self.modified.clear();
         }
-        if self.events.len() >= 4096 {
-            self.invalidate();
+        if self.events.len() >= MAX_EVENTS {
+            self.stats.queue_recoveries += 1;
+            let old = std::mem::take(&mut self.events);
+            for item in old {
+                self.fold(&item);
+                if matches!(
+                    item.kind,
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+                ) {
+                    self.events.push(item);
+                }
+            }
+            self.modified.clear();
+            self.fold(&event);
+            if matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+            ) && self.events.len() < MAX_EVENTS
+            {
+                self.events.push(event);
+            }
         } else {
             self.events.push(event);
         }
     }
+    #[cfg(test)]
+    fn push(&mut self, event: Event) {
+        let scope = event
+            .paths
+            .first()
+            .and_then(|p| p.ancestors().last())
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        self.push_in_scope(scope, event);
+    }
+    fn push_in_scope(&mut self, scope: PathBuf, event: Event) {
+        if event.need_rescan() {
+            if event.paths.is_empty() {
+                self.invalidate();
+            } else {
+                self.stats.backend_losses += 1;
+                for path in event.paths {
+                    self.pending_renames.remove(&path);
+                    self.folder(path, true);
+                }
+            }
+            return;
+        }
+        if self.overflow {
+            return;
+        }
+        if let Some((old, _)) = self.pending_renames.remove(&scope) {
+            if matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(RenameMode::To))
+            ) && old.paths.len() == 1
+                && event.paths.len() == 1
+            {
+                let mut both = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+                both.paths = vec![old.paths[0].clone(), event.paths[0].clone()];
+                self.retain(both);
+                return;
+            }
+            self.retain(old);
+        }
+        if matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::From))
+        ) {
+            self.pending_renames
+                .insert(scope, (event, std::time::Instant::now()));
+        } else {
+            self.retain(event);
+        }
+    }
+    fn drain(&mut self, roots: &[PathBuf]) -> Changes {
+        let expired: Vec<_> = self
+            .pending_renames
+            .iter()
+            .filter(|(_, (_, at))| at.elapsed() >= std::time::Duration::from_millis(100))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in expired {
+            let (event, _) = self.pending_renames.remove(&path).unwrap();
+            self.retain(event);
+        }
+        if std::mem::take(&mut self.overflow) {
+            for root in roots {
+                self.folder(root.clone(), true);
+            }
+        }
+        self.modified.clear();
+        self.stats.last_batch_folders = self.folders.len();
+        Changes {
+            events: std::mem::take(&mut self.events),
+            folders: std::mem::take(&mut self.folders).into_iter().collect(),
+            stats: self.stats.clone(),
+        }
+    }
 }
 pub struct LiveWatch {
-    _watcher: notify::RecommendedWatcher,
+    _watchers: Vec<windows_watch::NativeWatch>,
     queue: Arc<Mutex<Queue>>,
+    roots: Vec<PathBuf>,
     pub errors: Vec<String>,
 }
 pub struct BackgroundPriority(bool);
@@ -91,47 +249,49 @@ impl Drop for BackgroundPriority {
 impl LiveWatch {
     pub fn new(roots: &[PathBuf], exclude: PathBuf) -> Result<Self> {
         let queue = Arc::new(Mutex::new(Queue::default()));
-        let queued = queue.clone();
-        let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-            let mut q = queued.lock().unwrap_or_else(|e| e.into_inner());
-            match event {
-                Ok(event) => {
+        let mut errors = vec![];
+        let mut watchers = vec![];
+        for root in roots {
+            let queued = queue.clone();
+            let exclude = exclude.clone();
+            let scope = root.clone();
+            let receive: Arc<dyn Fn(Vec<Event>) + Send + Sync> = Arc::new(move |events| {
+                let mut q = queued.lock().unwrap_or_else(|e| e.into_inner());
+                for event in events {
                     if matches!(event.kind, EventKind::Access(_))
                         || (!event.paths.is_empty()
                             && event.paths.iter().all(|p| is_within(p, &exclude)))
                     {
-                        return;
+                        continue;
                     }
-                    q.push(event);
+                    q.push_in_scope(scope.clone(), event);
                 }
-                Err(_) => {
-                    q.invalidate();
-                }
-            }
-        })?;
-        let mut errors = vec![];
-        for root in roots {
-            if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
-                errors.push(format!("Watch {}: {error}", root.display()));
+            });
+            match windows_watch::NativeWatch::new(root.clone(), receive) {
+                Ok(watcher) => watchers.push(watcher),
+                Err(error) => errors.push(format!("Watch {}: {error}", root.display())),
             }
         }
         Ok(Self {
-            _watcher: watcher,
+            _watchers: watchers,
             queue,
+            roots: roots.to_vec(),
             errors,
         })
     }
-    pub fn take(&self) -> (Vec<Event>, bool) {
-        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        q.modified.clear();
-        (
-            std::mem::take(&mut q.events),
-            std::mem::take(&mut q.overflow),
-        )
+    pub fn take(&self) -> Changes {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(&self.roots)
     }
 }
 fn is_within(path: &Path, root: &Path) -> bool {
-    let clean = |p: &Path| crate::presentation::display_path(&p.to_string_lossy()).to_lowercase();
+    let clean = |p: &Path| {
+        crate::presentation::display_path(&p.to_string_lossy())
+            .replace('/', "\\")
+            .to_lowercase()
+    };
     let path = clean(path);
     let root = clean(root).trim_end_matches('\\').to_owned();
     path == root || path.starts_with(&(root + "\\"))
@@ -197,20 +357,25 @@ struct Edit<'a> {
     pending: HashSet<u64>,
     next: u64,
     sizes: bool,
+    children: HashMap<u64, HashMap<Vec<u16>, u64>>,
+    removed: HashSet<u64>,
 }
 impl Edit<'_> {
     fn child(&self, parent: u64, name: &[u16]) -> Option<u64> {
-        for (&id, record) in &self.records {
-            if let Some(r) = record
-                && r.parent == parent
-                && r.name == name
-            {
-                return Some(id);
-            }
+        if let Some(id) = self
+            .children
+            .get(&parent)
+            .and_then(|children| children.get(name))
+        {
+            return Some(*id);
         }
         self.search
             .child(parent, name)
-            .filter(|e| !self.records.contains_key(&e.id))
+            .filter(|e| match self.records.get(&e.id) {
+                Some(Some(record)) => record.parent == parent && record.name == name,
+                Some(None) => false,
+                None => true,
+            })
             .map(|e| e.id)
     }
     fn resolve(&self, path: &Path) -> Option<u64> {
@@ -245,34 +410,157 @@ impl Edit<'_> {
         if id == self.index.metadata.root_id {
             return;
         }
-        let mut removed = HashSet::from([id]);
-        if self.record(id).is_some_and(|r| r.flags & DIRECTORY != 0) {
-            loop {
-                let before = removed.len();
-                for entry in self.index.live_entries() {
-                    let parent = self
-                        .records
-                        .get(&entry.id)
-                        .and_then(Option::as_ref)
-                        .map_or(entry.parent, |r| r.parent);
-                    if removed.contains(&parent) {
-                        removed.insert(entry.id);
-                    }
+        self.erase(id);
+    }
+    fn erase(&mut self, id: u64) {
+        let directory = self.record(id).is_some_and(|r| r.flags & DIRECTORY != 0);
+        if let Some(Some(old)) = self.records.get(&id)
+            && let Some(children) = self.children.get_mut(&old.parent)
+        {
+            children.remove(&old.name);
+        }
+        self.records.insert(id, None);
+        self.pending.remove(&id);
+        if directory {
+            self.removed.insert(id);
+        }
+    }
+    fn finish_removals(&mut self) {
+        if self.removed.is_empty() {
+            return;
+        }
+        let mut removed = std::mem::take(&mut self.removed);
+        loop {
+            let mut children = Vec::new();
+            for entry in self.index.live_entries() {
+                if self.records.get(&entry.id).is_some_and(Option::is_none) {
+                    continue;
                 }
-                for record in self.records.values().filter_map(Option::as_ref) {
-                    if removed.contains(&record.parent) {
-                        removed.insert(record.id);
-                    }
-                }
-                if removed.len() == before {
-                    break;
+                let parent = self
+                    .records
+                    .get(&entry.id)
+                    .and_then(Option::as_ref)
+                    .map_or(entry.parent, |r| r.parent);
+                if removed.contains(&parent) {
+                    removed.insert(entry.id);
+                    children.push(entry.id);
                 }
             }
+            for (&id, record) in &self.records {
+                if let Some(record) = record
+                    && removed.contains(&record.parent)
+                {
+                    removed.insert(id);
+                    children.push(id);
+                }
+            }
+            if children.is_empty() {
+                break;
+            }
+            for id in children {
+                self.erase(id);
+            }
+            self.removed.clear();
         }
-        for id in removed {
-            self.records.insert(id, None);
-            self.pending.remove(&id);
+    }
+    fn reconcile(&mut self, folders: &[(PathBuf, bool)], exclude: &Path) -> Result<()> {
+        let mut todo: std::collections::VecDeque<_> = folders.iter().cloned().collect();
+        let mut scanned = HashMap::new();
+        let mut present = HashSet::new();
+        while let Some((path, recursive)) = todo.pop_front() {
+            if is_within(&path, exclude) || !is_within(&path, Path::new(&self.index.metadata.root))
+            {
+                continue;
+            }
+            self.upsert(&path, false, None)?;
+            let Some(id) = self.resolve(&path) else {
+                continue;
+            };
+            if scanned.get(&id).is_some_and(|done| *done || !recursive) {
+                continue;
+            }
+            if id != self.index.metadata.root_id
+                && !self
+                    .record(id)
+                    .is_some_and(|r| r.flags & DIRECTORY != 0 && r.flags & REPARSE == 0)
+            {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.remove(&path);
+                    continue;
+                }
+                Err(_) => {
+                    self.pending.insert(id);
+                    continue;
+                }
+            };
+            let mut complete = true;
+            for item in entries {
+                let entry = match item {
+                    Ok(e) => e,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+                let child_path = entry.path();
+                if is_within(&child_path, exclude) {
+                    continue;
+                }
+                let old = self.resolve(&child_path);
+                let retry = old.is_some_and(|id| self.pending.contains(&id));
+                self.upsert(&child_path, false, None)?;
+                if let Some(child) = self.resolve(&child_path) {
+                    present.insert(child);
+                    if (recursive || old.is_none() || retry)
+                        && self
+                            .record(child)
+                            .is_some_and(|r| r.flags & DIRECTORY != 0 && r.flags & REPARSE == 0)
+                    {
+                        todo.push_back((child_path, true));
+                    }
+                }
+            }
+            if complete {
+                scanned.insert(id, recursive);
+                self.pending.remove(&id);
+            } else {
+                self.pending.insert(id);
+            }
         }
+        // One metadata pass handles all reconciled parents. Never materialize every path
+        // or repeatedly traverse the complete index for each absent child.
+        if scanned.is_empty() {
+            return Ok(());
+        }
+        let mut stale: Vec<_> = self
+            .index
+            .live_entries()
+            .filter(|e| {
+                let parent = self
+                    .records
+                    .get(&e.id)
+                    .and_then(Option::as_ref)
+                    .map_or(e.parent, |r| r.parent);
+                scanned.contains_key(&parent)
+                    && !present.contains(&e.id)
+                    && !self.records.get(&e.id).is_some_and(Option::is_none)
+            })
+            .map(|e| e.id)
+            .collect();
+        stale.extend(self.records.iter().filter_map(|(&id, record)| {
+            record
+                .as_ref()
+                .filter(|r| scanned.contains_key(&r.parent) && !present.contains(&id))
+                .map(|_| id)
+        }));
+        for id in stale {
+            self.erase(id);
+        }
+        Ok(())
     }
     fn upsert(&mut self, path: &Path, recursive: bool, preferred: Option<u64>) -> Result<()> {
         if !is_within(path, Path::new(&self.index.metadata.root)) {
@@ -334,6 +622,20 @@ impl Edit<'_> {
                 || r.flags & (DIRECTORY | REPARSE) != flags
         });
         if changed {
+            if self.record(id).is_some_and(|r| r.flags & DIRECTORY != 0)
+                && (flags & DIRECTORY == 0 || flags & REPARSE != 0)
+            {
+                self.removed.insert(id);
+            }
+            if let Some(old) = self.record(id)
+                && let Some(children) = self.children.get_mut(&old.parent)
+            {
+                children.remove(&old.name);
+            }
+            self.children
+                .entry(parent)
+                .or_default()
+                .insert(record.name.clone(), id);
             self.records.insert(id, Some(record));
         }
         self.pending.remove(&id);
@@ -351,6 +653,16 @@ pub fn delta(
     index: &Index,
     search: &SearchIndex<'_>,
     events: &[Event],
+    sizes: bool,
+    exclude: &Path,
+) -> Result<Delta> {
+    changes(index, search, events, &[], sizes, exclude)
+}
+pub fn changes(
+    index: &Index,
+    search: &SearchIndex<'_>,
+    events: &[Event],
+    folders: &[(PathBuf, bool)],
     sizes: bool,
     exclude: &Path,
 ) -> Result<Delta> {
@@ -374,7 +686,13 @@ pub fn delta(
         pending: index.metadata.pending_refresh.iter().copied().collect(),
         next,
         sizes,
+        children: HashMap::new(),
+        removed: HashSet::new(),
     };
+    let mut recovery = Queue::default();
+    for (path, recursive) in folders {
+        recovery.folder(path.clone(), *recursive);
+    }
     let paired: HashSet<_> = events
         .iter()
         .filter(|e| {
@@ -406,9 +724,15 @@ pub fn delta(
             }
             let id = edit.resolve(old);
             if is_within(new, Path::new(&index.metadata.root)) {
-                edit.upsert(new, id.is_none(), id)?;
+                edit.upsert(new, false, id)?;
+                if id.is_none() {
+                    recovery.folder(new.clone(), true);
+                }
             } else {
                 edit.remove(old);
+            }
+            for path in &event.paths {
+                recovery.folder(path.parent().unwrap_or(path).to_owned(), false);
             }
             continue;
         }
@@ -417,15 +741,34 @@ pub fn delta(
                 continue;
             }
             match event.kind {
-                EventKind::Remove(_) => edit.remove(path),
-                EventKind::Modify(ModifyKind::Name(RenameMode::From)) if !paired.contains(path) => {
-                    edit.remove(path)
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)) if paired.contains(path) => {}
+                EventKind::Create(_)
+                | EventKind::Remove(_)
+                | EventKind::Modify(ModifyKind::Name(_)) => {
+                    recovery.folder(path.parent().unwrap_or(path).to_owned(), false);
                 }
-                EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {}
-                _ => edit.upsert(path, edit.resolve(path).is_none(), None)?,
+                _ => {
+                    let id = edit.resolve(path);
+                    if id.is_none() {
+                        recovery.folder(path.parent().unwrap_or(path).to_owned(), false);
+                    } else if id == Some(index.metadata.root_id)
+                        || id
+                            .and_then(|id| edit.record(id))
+                            .is_some_and(|r| r.flags & DIRECTORY != 0)
+                    {
+                        recovery.folder(path.clone(), false);
+                    } else {
+                        edit.upsert(path, false, None)?;
+                    }
+                }
             }
         }
     }
+    let folders: Vec<_> = recovery.folders.into_iter().collect();
+    if !folders.is_empty() {
+        edit.reconcile(&folders, exclude)?;
+    }
+    edit.finish_removals();
     let mut metadata = index.metadata.clone();
     for (&id, record) in &edit.records {
         let old = index.get(id).is_some_and(|e| e.flags & REPARSE != 0);
@@ -487,6 +830,243 @@ mod tests {
         );
         assert!(queue.events.is_empty());
     }
+    #[test]
+    fn structural_burst_is_recoverable_without_discarding_the_loaded_index() {
+        let mut queue = Queue::default();
+        for number in 0..10_000 {
+            queue.push(event(
+                EventKind::Create(notify::event::CreateKind::Any),
+                vec![PathBuf::from(format!(r"C:\fixture\new-{number}.txt"))],
+            ));
+        }
+        assert!(
+            !queue.overflow,
+            "application queue pressure must preserve folder recovery work"
+        );
+        assert!(queue.events.len() <= 4096, "recovery must keep RAM bounded");
+    }
+    #[test]
+    fn folder_recovery_reconciles_a_structural_burst_and_real_loss_without_rewriting_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        let storage = dir.path().join("data");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::create_dir_all(root.join("removed/deep")).unwrap();
+        std::fs::write(root.join("removed/deep/old.txt"), b"old").unwrap();
+        std::fs::write(root.join("kept.txt"), b"zero").unwrap();
+        let (mut index, _) = rustsearch_windows::walk(&root, true).unwrap();
+        let output = storage.join("source.rsidx");
+        index.snapshot_identity = Some(rustsearch_storage::save(&output, &index).unwrap());
+        drop(SearchIndex::prepare(&index, &output, true).0);
+        let base = std::fs::read(&output).unwrap();
+        let cache = std::fs::read(rustsearch_query::cache_path(&output)).unwrap();
+        std::fs::remove_dir_all(root.join("removed")).unwrap();
+        let mut queue = Queue::default();
+        queue.push(event(
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+            vec![root.join("removed")],
+        ));
+        for number in 0..4200 {
+            let file = root.join(format!("new-{number}.txt"));
+            std::fs::write(&file, b"").unwrap();
+            queue.push(event(
+                EventKind::Create(notify::event::CreateKind::File),
+                vec![file],
+            ));
+        }
+        let batch = queue.drain(std::slice::from_ref(&root));
+        assert!(!batch.folders.is_empty());
+        assert_eq!(batch.stats.queue_recoveries, 1);
+        let search = SearchIndex::prepare(&index, &output, true).0;
+        let delta = changes(
+            &index,
+            &search,
+            &batch.events,
+            &batch.folders,
+            true,
+            &storage,
+        )
+        .unwrap();
+        drop(search);
+        let guard = rustsearch_storage::WriteGuard::acquire(&output).unwrap();
+        rustsearch_storage::append_delta(&guard, &index, &delta).unwrap();
+        index.apply_delta(delta).unwrap();
+        drop(guard);
+        assert_eq!(index.counts().0, 4201);
+        assert_eq!(
+            rustsearch_query::Query {
+                text: "old.txt".into(),
+                limit: 10,
+                ..Default::default()
+            }
+            .execute(&index)
+            .total,
+            0
+        );
+        std::fs::write(root.join("kept.txt"), b"resized").unwrap();
+        std::fs::create_dir(root.join("new-directory")).unwrap();
+        std::fs::write(root.join("new-directory/after-loss.txt"), b"loss").unwrap();
+        queue.push(Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan));
+        let batch = queue.drain(std::slice::from_ref(&root));
+        assert_eq!(batch.stats.backend_losses, 1);
+        let search = SearchIndex::prepare(&index, &output, true).0;
+        let delta = changes(
+            &index,
+            &search,
+            &batch.events,
+            &batch.folders,
+            true,
+            &storage,
+        )
+        .unwrap();
+        drop(search);
+        let guard = rustsearch_storage::WriteGuard::acquire(&output).unwrap();
+        rustsearch_storage::append_delta(&guard, &index, &delta).unwrap();
+        index.apply_delta(delta).unwrap();
+        drop(guard);
+        assert_eq!(index.counts().0, 4203);
+        let query = rustsearch_query::Query {
+            text: "after-loss.txt".into(),
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            query
+                .execute(&rustsearch_storage::load(&output).unwrap())
+                .total,
+            1
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), base);
+        assert_eq!(
+            std::fs::read(rustsearch_query::cache_path(&output)).unwrap(),
+            cache
+        );
+    }
+    #[test]
+    fn folder_pressure_broadens_coverage_and_unpaired_renames_never_cross_drives() {
+        let mut queue = Queue::default();
+        for number in 0..12_000 {
+            queue.push(event(
+                EventKind::Create(notify::event::CreateKind::File),
+                vec![PathBuf::from(format!(
+                    r"C:\fixture\folder-{number}\file.txt"
+                ))],
+            ));
+        }
+        let batch = queue.drain(&[PathBuf::from(r"C:\")]);
+        assert!(batch.folders.len() <= MAX_FOLDERS);
+        assert!(
+            batch
+                .folders
+                .iter()
+                .any(|(p, recursive)| p == Path::new(r"C:\fixture") && *recursive)
+        );
+        let mut queue = Queue::default();
+        queue.push(event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            vec![PathBuf::from(r"C:\old.txt")],
+        ));
+        queue.push(event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            vec![PathBuf::from(r"D:\new.txt")],
+        ));
+        for (_, at) in queue.pending_renames.values_mut() {
+            *at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        }
+        let batch = queue.drain(&[]);
+        assert_eq!(batch.events.len(), 2);
+        assert!(!batch.events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+        )));
+    }
+    #[test]
+    fn folder_recovery_discards_a_staged_file_that_vanished_before_enumeration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        let (index, _) = rustsearch_windows::walk(&root, true).unwrap();
+        let search = SearchIndex::build(&index);
+        let mut edit = Edit {
+            index: &index,
+            search: &search,
+            records: BTreeMap::new(),
+            pending: HashSet::new(),
+            next: 2,
+            sizes: true,
+            children: HashMap::new(),
+            removed: HashSet::new(),
+        };
+        let file = root.join("temporary.txt");
+        std::fs::write(&file, b"temporary").unwrap();
+        edit.upsert(&file, false, None).unwrap();
+        let id = edit.resolve(&file).unwrap();
+        std::fs::remove_file(file).unwrap();
+        edit.reconcile(&[(root, false)], &dir.path().join("excluded"))
+            .unwrap();
+        assert!(edit.records.get(&id).is_some_and(Option::is_none));
+    }
+    #[test]
+    fn rename_pairing_is_scoped_to_each_reader_even_on_the_same_drive() {
+        let mut queue = Queue::default();
+        let a = PathBuf::from(r"C:\first");
+        let b = PathBuf::from(r"C:\second");
+        for root in [&a, &b] {
+            queue.push_in_scope(
+                root.clone(),
+                event(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                    vec![root.join("old.txt")],
+                ),
+            );
+        }
+        for root in [&a, &b] {
+            queue.push_in_scope(
+                root.clone(),
+                event(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                    vec![root.join("new.txt")],
+                ),
+            );
+        }
+        let batch = queue.drain(&[]);
+        assert_eq!(batch.events.len(), 2);
+        for event in batch.events {
+            assert_eq!(event.paths[0].parent(), event.paths[1].parent());
+            assert!(matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+            ));
+        }
+    }
+    #[test]
+    fn renamed_cached_child_does_not_shadow_a_new_file_at_its_old_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), b"original").unwrap();
+        let (index, _) = rustsearch_windows::walk(dir.path(), true).unwrap();
+        let search = SearchIndex::build(&index);
+        let mut edit = Edit {
+            index: &index,
+            search: &search,
+            records: BTreeMap::new(),
+            pending: HashSet::new(),
+            next: 3,
+            sizes: true,
+            children: HashMap::new(),
+            removed: HashSet::new(),
+        };
+        let old = dir.path().join("old.txt");
+        let new = dir.path().join("new.txt");
+        let original = edit.resolve(&old).unwrap();
+        std::fs::rename(&old, &new).unwrap();
+        edit.upsert(&new, false, Some(original)).unwrap();
+        assert_eq!(edit.resolve(&old), None);
+        std::fs::write(&old, b"replacement").unwrap();
+        edit.upsert(&old, false, None).unwrap();
+        assert_ne!(edit.resolve(&old), Some(original));
+        assert_eq!(edit.resolve(&new), Some(original));
+    }
     fn commit(index: &mut Index, events: &[Event], path: &Path, exclude: &Path) {
         let search = SearchIndex::prepare(index, path, true).0;
         let change = delta(index, &search, events, true, exclude).unwrap();
@@ -520,15 +1100,16 @@ mod tests {
         let base = std::fs::read(&path).unwrap();
         let cached = std::fs::read(rustsearch_query::cache_path(&path)).unwrap();
         std::fs::rename(source.join("Before"), source.join("İstanbul-Ω")).unwrap();
-        commit(
-            &mut index,
-            &[event(
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-                vec![source.join("Before"), source.join("İstanbul-Ω")],
-            )],
-            &path,
-            &output,
-        );
+        let mut queue = Queue::default();
+        queue.push(event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            vec![source.join("Before")],
+        ));
+        queue.push(event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            vec![source.join("İstanbul-Ω")],
+        ));
+        commit(&mut index, &queue.events, &path, &output);
         assert_eq!(
             index.path_utf16(index.get(child).unwrap()).unwrap(),
             source

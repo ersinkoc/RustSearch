@@ -28,7 +28,7 @@ The [0.0.1 Windows x64 portable alpha](https://github.com/ersinkoc/RustSearch/re
 
 Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates CLI-native snapshots; the desktop has a separate per-user background worker for managed sources. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
 
-Full-drive monitoring has not passed acceptance: the current 0.0.1 worker repeatedly reconciled after notification overflow on the approximately 21.86-million-record C:/D:/E: scope. Snapshot searches passed; full-scope live updates and an idle resource budget remain unaccepted. See the [measured full-drive report](docs/FULL_DRIVE_ACCEPTANCE.md).
+The published v0.0.1 archive predates the notification-overflow fix. The subsequent source build keeps its loaded index during queue recovery and has passed C:/D:/E: live-update checks on approximately 21.93 million records. See the [recovery and resource results](docs/OVERFLOW_RECOVERY_RESULTS.md) and the [original failure report](docs/FULL_DRIVE_ACCEPTANCE.md). The existing release ZIP has not been replaced.
 
 ## Build and try
 
@@ -81,7 +81,8 @@ The common one-character substring follow-up reduced the `a` query from 12.04 to
 - [CLI commands and limitations](docs/CLI.md)
 - [Desktop app and shortcuts](docs/DESKTOP.md)
 - [Desktop visual and correctness checks](docs/DESKTOP_RESULTS.md)
-- [Full-drive search, monitoring failure, and resource measurements](docs/FULL_DRIVE_ACCEPTANCE.md)
+- [Full-drive search and original monitoring failure](docs/FULL_DRIVE_ACCEPTANCE.md)
+- [Notification overflow recovery and full-drive live-update results](docs/OVERFLOW_RECOVERY_RESULTS.md)
 - [Product and technical plan](docs/PROJECT_PLAN.md)
 - [Everything baseline and feature gaps](docs/FEATURE_BASELINE.md)
 - [Benchmark protocol and engineering targets](docs/BENCHMARKS.md)

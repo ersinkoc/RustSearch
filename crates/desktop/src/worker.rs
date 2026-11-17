@@ -895,6 +895,37 @@ mod tests {
         let state = command_state(&data, Rpc::Configure(config), false).unwrap();
         assert!(!state.profile.paused);
         result(&mut client, 1);
+        let mut pressure = profile(&data);
+        pressure.paused = true;
+        assert!(
+            command_state(&data, Rpc::Configure(pressure.clone()), false)
+                .unwrap()
+                .profile
+                .paused
+        );
+        for number in 0..4200 {
+            std::fs::write(source.join(format!("burst-{number}.txt")), b"").unwrap();
+        }
+        pressure.paused = false;
+        command_state(&data, Rpc::Configure(pressure), false).unwrap();
+        send(
+            &mut client,
+            &Rpc::Request(Request::Search {
+                generation: 4,
+                search: SearchSpec {
+                    text: "burst-".into(),
+                    limit: 10,
+                    ..Default::default()
+                },
+            }),
+        )
+        .unwrap();
+        let recovered = result(&mut client, 4200);
+        assert_eq!(
+            recovered.path, info.path,
+            "queue pressure must not replace the published source"
+        );
+        assert_eq!(recovered.records, 4203);
         let endpoint: Endpoint =
             serde_json::from_slice(&std::fs::read(data.join("endpoint.json")).unwrap()).unwrap();
         let mut bad = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, endpoint.port)).unwrap();
