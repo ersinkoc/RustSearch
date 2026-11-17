@@ -469,6 +469,13 @@ pub fn run(root: PathBuf) -> Result<()> {
     let state = runtime.clone();
     let state_root = root.clone();
     let current_sequence = sequence.clone();
+    let reuse_saved = config.auto_index
+        && !config.paused
+        && !config.roots.is_empty()
+        && config.catalog.as_ref().is_some_and(|path| path.is_file());
+    let startup_reuse = Arc::new(AtomicBool::new(reuse_saved));
+    let reused = startup_reuse.clone();
+    let fallback_engine = Arc::downgrade(&engine);
     std::thread::spawn(move || {
         let mut revision = None;
         while let Ok(event) = rx.recv_blocking() {
@@ -480,6 +487,38 @@ pub fn run(root: PathBuf) -> Result<()> {
             };
             if event_generation != current_sequence.load(Ordering::Acquire) {
                 continue;
+            }
+            if matches!(&event, Event::Error { .. }) && reused.swap(false, Ordering::AcqRel) {
+                let config = state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .profile
+                    .clone();
+                let generation = current_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+                if !config.auto_index || config.paused {
+                    continue;
+                }
+                let Some(fallback_engine) = fallback_engine.upgrade() else {
+                    break;
+                };
+                fallback_engine.submit(
+                    Request::ScanComputer {
+                        roots: config.roots,
+                        directory: state_root.join(format!("managed-{}", now_ms())),
+                        mode: config.mode,
+                        sizes: config.sizes,
+                        generation,
+                        search: SearchSpec {
+                            limit: 500,
+                            ..Default::default()
+                        },
+                    },
+                    generation,
+                );
+                continue;
+            }
+            if matches!(&event, Event::Results { .. }) {
+                reused.store(false, Ordering::Release);
             }
             let mut changed = true;
             let mut obsolete = None;
@@ -493,10 +532,13 @@ pub fn run(root: PathBuf) -> Result<()> {
                             source.sequence,
                             source.records,
                             source.pending,
+                            source.recovering,
                         );
                         changed = revision.as_ref() != Some(&next);
                         revision = Some(next);
-                        state.phase = if source.live {
+                        state.phase = if source.recovering {
+                            "Checking saved files"
+                        } else if source.live {
                             "Monitoring changes"
                         } else {
                             "Read-only snapshot"
@@ -543,10 +585,8 @@ pub fn run(root: PathBuf) -> Result<()> {
             limit: 500,
             ..Default::default()
         };
-        // Accessible snapshots need reconciliation after a period without a watcher.
-        let request = if config.mode == ScanMode::Native
-            && config.catalog.as_ref().is_some_and(|p| p.is_file())
-        {
+        // Reuse the immutable source and reconcile watcher downtime in bounded batches.
+        let request = if reuse_saved {
             Request::Open {
                 path: config.catalog.clone().unwrap(),
                 generation: 1,
@@ -585,6 +625,7 @@ pub fn run(root: PathBuf) -> Result<()> {
                 let stop = stop.clone();
                 let active = active.clone();
                 let sequence = sequence.clone();
+                let startup_reuse = startup_reuse.clone();
                 std::thread::spawn(move || {
                     let _slot = slot;
                     let serve = (|| -> Result<()> {
@@ -668,6 +709,9 @@ pub fn run(root: PathBuf) -> Result<()> {
                                     }
                                 }
                                 Rpc::Request(mut request) => {
+                                    if !matches!(&request, Request::Search { .. }) {
+                                        startup_reuse.store(false, Ordering::Release);
+                                    }
                                     client
                                         .generation
                                         .store(request_generation(&request), Ordering::Release);
@@ -702,6 +746,9 @@ pub fn run(root: PathBuf) -> Result<()> {
                                     engine.submit(request, global);
                                 }
                                 Rpc::Configure(mut profile) => {
+                                    if !profile.auto_index || profile.paused {
+                                        startup_reuse.store(false, Ordering::Release);
+                                    }
                                     let mut state =
                                         runtime.lock().unwrap_or_else(|e| e.into_inner());
                                     if !profile.background && state.profile.background {
@@ -824,6 +871,86 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn accessible_restart_reuses_saved_catalog_and_reconciles_offline_changes() {
+        for corrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            let source = dir.path().join("source");
+            std::fs::create_dir_all(data.join("saved")).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("before.txt"), b"before").unwrap();
+            let (mut index, _) = rustsearch_windows::walk(&source, false).unwrap();
+            let snapshot = data.join("saved/drive-0.rsidx");
+            index.snapshot_identity = Some(rustsearch_storage::save(&snapshot, &index).unwrap());
+            drop(rustsearch_query::SearchIndex::prepare(&index, &snapshot, true).0);
+            let catalog = data.join("saved/computer.rscatalog");
+            crate::catalog::Catalog {
+                version: 1,
+                snapshots: vec![snapshot.clone()],
+                warnings: vec![],
+            }
+            .save(&catalog)
+            .unwrap();
+            if corrupt {
+                let mut bytes = std::fs::read(&snapshot).unwrap();
+                *bytes.last_mut().unwrap() ^= 1;
+                std::fs::write(&snapshot, bytes).unwrap();
+            }
+            let base = std::fs::read(&snapshot).unwrap();
+            let cache = std::fs::read(rustsearch_query::cache_path(&snapshot)).unwrap();
+            std::fs::write(source.join("offline.txt"), b"offline").unwrap();
+            save(
+                &data,
+                "background.json",
+                &Profile {
+                    roots: vec![source],
+                    catalog: Some(catalog.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let root = data.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let _ = done_tx.send(run(root));
+            });
+            let end = Instant::now() + Duration::from_secs(10);
+            let mut client = loop {
+                if let Ok(client) = connect(&data) {
+                    break client;
+                }
+                assert!(Instant::now() < end, "worker startup timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            send(&mut client, &Rpc::Current(1)).unwrap();
+            let found = result(&mut client, 2);
+            client.shutdown(Shutdown::Both).unwrap();
+            command_state(&data, Rpc::Stop, false).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            server.join().unwrap();
+            if corrupt {
+                assert_ne!(
+                    found.path, catalog,
+                    "corrupt saved source must fall back once"
+                );
+            } else {
+                assert_eq!(
+                    found.path, catalog,
+                    "restart must catch up the saved source instead of replacing its catalog"
+                );
+            }
+            assert_eq!(std::fs::read(&snapshot).unwrap(), base);
+            assert_eq!(
+                std::fs::read(rustsearch_query::cache_path(&snapshot)).unwrap(),
+                cache
+            );
+        }
+    }
+
     #[test]
     fn background_worker_authenticates_updates_while_gui_is_closed_and_pauses() {
         let dir = tempfile::tempdir().unwrap();

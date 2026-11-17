@@ -5,7 +5,10 @@ use notify::{
 };
 use rustsearch_core::{DIRECTORY, Delta, Index, REPARSE, Record, SIZE_KNOWN};
 use rustsearch_query::SearchIndex;
-use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+use std::os::windows::{
+    ffi::{OsStrExt, OsStringExt},
+    fs::MetadataExt,
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -366,6 +369,136 @@ struct ParentRun {
     first: u32,
     end: u32,
 }
+#[derive(Clone, Copy)]
+struct Job {
+    recursive: bool,
+    hot: bool,
+}
+#[derive(Default)]
+pub struct Recovery {
+    folders: Vec<(PathBuf, bool)>,
+    hot: std::collections::VecDeque<u64>,
+    cold: std::collections::VecDeque<u64>,
+    queued: HashMap<u64, Job>,
+    completed: HashMap<u64, bool>,
+    parent_runs: Option<Vec<ParentRun>>,
+    base: Option<(Option<[u8; 24]>, usize, usize)>,
+}
+impl Recovery {
+    pub fn schedule(&mut self, path: PathBuf, recursive: bool) {
+        self.folders.push((path, recursive));
+    }
+    pub fn is_empty(&self) -> bool {
+        self.folders.is_empty() && self.queued.is_empty()
+    }
+    fn enqueue(&mut self, id: u64, job: Job, external: bool) {
+        if external {
+            if job.recursive {
+                self.completed.clear();
+            } else {
+                self.completed.remove(&id);
+            }
+        } else if self
+            .completed
+            .get(&id)
+            .is_some_and(|done| *done || !job.recursive)
+        {
+            return;
+        }
+        if let Some(old) = self.queued.get_mut(&id) {
+            old.recursive |= job.recursive;
+            if job.hot {
+                let was_hot = old.hot;
+                old.hot = true;
+                if external {
+                    self.hot.push_front(id);
+                } else if !was_hot {
+                    self.hot.push_back(id);
+                }
+            }
+        } else {
+            self.queued.insert(id, job);
+            if job.hot {
+                if external {
+                    self.hot.push_front(id);
+                } else {
+                    self.hot.push_back(id);
+                }
+            } else {
+                self.cold.push_back(id);
+            }
+        }
+    }
+    fn pop(&mut self) -> Option<(u64, Job)> {
+        loop {
+            let (id, hot) = if let Some(id) = self.hot.pop_front() {
+                (id, true)
+            } else {
+                (self.cold.pop_front()?, false)
+            };
+            let Some(job) = self.queued.get(&id).copied() else {
+                continue;
+            };
+            if job.hot && !hot {
+                continue;
+            }
+            self.queued.remove(&id);
+            return Some((id, job));
+        }
+    }
+    pub fn step(
+        &mut self,
+        index: &Index,
+        search: &SearchIndex<'_>,
+        events: &[Event],
+        folders: &[(PathBuf, bool)],
+        sizes: bool,
+        exclude: &Path,
+    ) -> Result<Delta> {
+        self.step_with_limit(index, search, events, folders, sizes, exclude, 32)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn step_with_limit(
+        &mut self,
+        index: &Index,
+        search: &SearchIndex<'_>,
+        events: &[Event],
+        folders: &[(PathBuf, bool)],
+        sizes: bool,
+        exclude: &Path,
+        limit: usize,
+    ) -> Result<Delta> {
+        let base = (
+            index.snapshot_identity,
+            index.entries.as_ptr() as usize,
+            index.entries.len(),
+        );
+        if self.base != Some(base) {
+            self.hot.clear();
+            self.cold.clear();
+            self.queued.clear();
+            self.completed.clear();
+            self.parent_runs = None;
+            self.base = Some(base);
+        }
+        let delta = changes_inner(
+            index,
+            search,
+            events,
+            folders,
+            sizes,
+            exclude,
+            Some((&mut *self, limit)),
+        )?;
+        if self.is_empty() {
+            self.parent_runs = None;
+            self.completed = HashMap::new();
+            self.hot.clear();
+            self.cold.clear();
+        }
+        Ok(delta)
+    }
+}
 fn parent_runs(index: &Index) -> Option<Vec<ParentRun>> {
     // Accessible snapshots enumerate each parent's children together. Keep only row
     // boundaries, capped at 64 MiB and dropped after this recovery transaction.
@@ -516,52 +649,89 @@ impl Edit<'_> {
         }
     }
     fn reconcile(&mut self, folders: &[(PathBuf, bool)], exclude: &Path) -> Result<()> {
+        let mut work = Recovery::default();
+        work.folders.extend_from_slice(folders);
+        self.reconcile_chunk(&mut work, exclude, usize::MAX, std::time::Duration::MAX)
+    }
+    fn reconcile_chunk(
+        &mut self,
+        work: &mut Recovery,
+        exclude: &Path,
+        limit: usize,
+        time: std::time::Duration,
+    ) -> Result<()> {
+        let folders = std::mem::take(&mut work.folders);
         let relevant: Vec<_> = folders
             .iter()
             .filter(|(path, _)| {
                 is_within(path, Path::new(&self.index.metadata.root)) && !is_within(path, exclude)
             })
             .collect();
-        if relevant.len() >= 64 || relevant.iter().any(|(_, recursive)| *recursive) {
+        if self.parent_runs.is_none()
+            && (relevant.len() >= 64 || relevant.iter().any(|(_, r)| *r) || !work.queued.is_empty())
+        {
             self.parent_runs = parent_runs(self.index);
         }
-        let mut todo: std::collections::VecDeque<_> = folders.iter().cloned().collect();
+        for (path, recursive) in relevant {
+            self.upsert(path, false, None)?;
+            if let Some(id) = self.resolve(path) {
+                work.enqueue(
+                    id,
+                    Job {
+                        recursive: *recursive,
+                        hot: !*recursive
+                            || (id != self.index.metadata.root_id && self.index.get(id).is_none()),
+                    },
+                    true,
+                );
+            }
+        }
+        let started = std::time::Instant::now();
         let mut scanned = HashMap::new();
         let mut present = HashSet::new();
-        while let Some((path, recursive)) = todo.pop_front() {
-            if is_within(&path, exclude) || !is_within(&path, Path::new(&self.index.metadata.root))
-            {
+        let mut visited = 0;
+        while visited < limit && (visited == 0 || started.elapsed() < time) {
+            let Some((id, job)) = work.pop() else { break };
+            visited += 1;
+            if id != self.index.metadata.root_id && self.record(id).is_none() {
                 continue;
             }
-            self.upsert(&path, false, None)?;
-            let Some(id) = self.resolve(&path) else {
+            let Some(path) = self.path(id)? else {
                 continue;
             };
-            if scanned.get(&id).is_some_and(|done| *done || !recursive) {
+            if is_within(&path, exclude) {
                 continue;
             }
+            // Recheck directory attributes when dequeued; cached child metadata must not
+            // permit following a directory that became a reparse point between batches.
+            self.upsert(&path, false, Some(id))?;
             if id != self.index.metadata.root_id
-                && !self
+                && self
                     .record(id)
-                    .is_some_and(|r| r.flags & DIRECTORY != 0 && r.flags & REPARSE == 0)
+                    .is_none_or(|r| r.flags & (DIRECTORY | REPARSE) != DIRECTORY)
             {
                 continue;
             }
             let entries = match std::fs::read_dir(&path) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.remove(&path);
+                    if id != self.index.metadata.root_id {
+                        self.erase(id);
+                    } else {
+                        self.pending.insert(id);
+                    }
                     continue;
                 }
                 Err(_) => {
                     self.pending.insert(id);
+                    work.completed.insert(id, job.recursive);
                     continue;
                 }
             };
             let mut complete = true;
             for item in entries {
                 let entry = match item {
-                    Ok(e) => e,
+                    Ok(entry) => entry,
                     Err(_) => {
                         complete = false;
                         continue;
@@ -571,22 +741,40 @@ impl Edit<'_> {
                 if is_within(&child_path, exclude) {
                     continue;
                 }
-                let old = self.resolve(&child_path);
+                let name: Vec<_> = entry.file_name().encode_wide().collect();
+                let old = self.child(id, &name);
                 let retry = old.is_some_and(|id| self.pending.contains(&id));
-                self.upsert(&child_path, false, None)?;
-                if let Some(child) = self.resolve(&child_path) {
-                    present.insert(child);
-                    if (recursive || old.is_none() || retry)
-                        && self
-                            .record(child)
-                            .is_some_and(|r| r.flags & DIRECTORY != 0 && r.flags & REPARSE == 0)
-                    {
-                        todo.push_back((child_path, true));
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        complete = false;
+                        if let Some(old) = old {
+                            present.insert(old);
+                            self.pending.insert(old);
+                        }
+                        continue;
                     }
+                };
+                let child = self.put_metadata(id, name, &metadata, old)?;
+                present.insert(child);
+                if (job.recursive || old.is_none() || retry)
+                    && self
+                        .record(child)
+                        .is_some_and(|r| r.flags & (DIRECTORY | REPARSE) == DIRECTORY)
+                {
+                    work.enqueue(
+                        child,
+                        Job {
+                            recursive: true,
+                            hot: job.hot && old.is_none(),
+                        },
+                        false,
+                    );
                 }
             }
+            work.completed.insert(id, job.recursive);
             if complete {
-                scanned.insert(id, recursive);
+                scanned.insert(id, job.recursive);
                 self.pending.remove(&id);
             } else {
                 self.pending.insert(id);
@@ -597,21 +785,45 @@ impl Edit<'_> {
         if scanned.is_empty() {
             return Ok(());
         }
-        let mut stale: Vec<_> = self
-            .index
-            .live_entries()
-            .filter(|e| {
-                let parent = self
-                    .records
-                    .get(&e.id)
-                    .and_then(Option::as_ref)
-                    .map_or(e.parent, |r| r.parent);
-                scanned.contains_key(&parent)
-                    && !present.contains(&e.id)
-                    && !self.records.get(&e.id).is_some_and(Option::is_none)
-            })
-            .map(|e| e.id)
-            .collect();
+        let stale_entry = |e: &rustsearch_core::Entry| {
+            let parent = self
+                .records
+                .get(&e.id)
+                .and_then(Option::as_ref)
+                .map_or(e.parent, |r| r.parent);
+            scanned.contains_key(&parent)
+                && !present.contains(&e.id)
+                && !self.records.get(&e.id).is_some_and(Option::is_none)
+        };
+        let mut stale = Vec::new();
+        if let Some(runs) = &self.parent_runs {
+            for parent in scanned.keys() {
+                let from = runs.partition_point(|run| run.parent < *parent);
+                let to = runs.partition_point(|run| run.parent <= *parent);
+                for run in &runs[from..to] {
+                    for e in &self.index.entries[run.first as usize..run.end as usize] {
+                        if !self.index.updates.contains_key(&e.id) && stale_entry(e) {
+                            stale.push(e.id);
+                        }
+                    }
+                }
+            }
+            stale.extend(
+                self.index
+                    .updates
+                    .values()
+                    .filter_map(Option::as_ref)
+                    .filter(|e| stale_entry(e))
+                    .map(|e| e.id),
+            );
+        } else {
+            stale.extend(
+                self.index
+                    .live_entries()
+                    .filter(|e| stale_entry(e))
+                    .map(|e| e.id),
+            );
+        }
         stale.extend(self.records.iter().filter_map(|(&id, record)| {
             record
                 .as_ref()
@@ -676,6 +888,21 @@ impl Edit<'_> {
                 return Ok(());
             }
         };
+        self.put_metadata(parent, name, &metadata, old)?;
+        if recursive && metadata.is_dir() && metadata.file_attributes() & 0x400 == 0 {
+            for entry in std::fs::read_dir(path)? {
+                self.upsert(&entry?.path(), true, None)?;
+            }
+        }
+        Ok(())
+    }
+    fn put_metadata(
+        &mut self,
+        parent: u64,
+        name: Vec<u16>,
+        metadata: &std::fs::Metadata,
+        old: Option<u64>,
+    ) -> Result<u64> {
         let reparse = metadata.file_attributes() & 0x400 != 0;
         let flags =
             if metadata.is_dir() { DIRECTORY } else { 0 } | if reparse { REPARSE } else { 0 };
@@ -718,12 +945,29 @@ impl Edit<'_> {
             self.records.insert(id, Some(record));
         }
         self.pending.remove(&id);
-        if recursive && metadata.is_dir() && !reparse {
-            for entry in std::fs::read_dir(path)? {
-                self.upsert(&entry?.path(), true, None)?;
+        Ok(id)
+    }
+    fn path(&self, id: u64) -> Result<Option<PathBuf>> {
+        let mut current = id;
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        while current != self.index.metadata.root_id {
+            ensure!(seen.insert(current), "cycle in recovery path");
+            if self.records.get(&current).is_some_and(Option::is_none) {
+                return Ok(None);
             }
+            let record = self.record(current).context("missing recovery parent")?;
+            if current != id && record.flags & (DIRECTORY | REPARSE) != DIRECTORY {
+                return Ok(None);
+            }
+            names.push(record.name);
+            current = record.parent;
         }
-        Ok(())
+        let mut path = PathBuf::from(&self.index.metadata.root);
+        for name in names.into_iter().rev() {
+            path.push(std::ffi::OsString::from_wide(&name));
+        }
+        Ok(Some(path))
     }
 }
 
@@ -744,6 +988,18 @@ pub fn changes(
     folders: &[(PathBuf, bool)],
     sizes: bool,
     exclude: &Path,
+) -> Result<Delta> {
+    changes_inner(index, search, events, folders, sizes, exclude, None)
+}
+#[allow(clippy::too_many_arguments)]
+fn changes_inner(
+    index: &Index,
+    search: &SearchIndex<'_>,
+    events: &[Event],
+    folders: &[(PathBuf, bool)],
+    sizes: bool,
+    exclude: &Path,
+    mut work: Option<(&mut Recovery, usize)>,
 ) -> Result<Delta> {
     let next = index
         .entries
@@ -767,8 +1023,15 @@ pub fn changes(
         sizes,
         children: HashMap::new(),
         removed: HashSet::new(),
-        parent_runs: None,
+        parent_runs: work.as_mut().and_then(|(work, _)| work.parent_runs.take()),
     };
+    if edit.parent_runs.is_none()
+        && (work.as_ref().is_some_and(|(work, _)| !work.is_empty())
+            || folders.len() >= 64
+            || folders.iter().any(|(_, recursive)| *recursive))
+    {
+        edit.parent_runs = parent_runs(index);
+    }
     let mut recovery = Queue::default();
     for (path, recursive) in folders {
         recovery.folder(path.clone(), *recursive);
@@ -849,7 +1112,11 @@ pub fn changes(
         }
     }
     let folders: Vec<_> = recovery.folders.into_iter().collect();
-    if !folders.is_empty() {
+    if let Some((work, limit)) = work {
+        work.folders.extend(folders);
+        edit.reconcile_chunk(work, exclude, limit, std::time::Duration::from_millis(25))?;
+        work.parent_runs = edit.parent_runs.take();
+    } else if !folders.is_empty() {
         edit.reconcile(&folders, exclude)?;
     }
     edit.finish_removals();
@@ -1161,6 +1428,236 @@ mod tests {
         rustsearch_storage::append_delta(&guard, index, &change).unwrap();
         index.apply_delta(change).unwrap();
     }
+    #[test]
+    fn unavailable_root_keeps_saved_rows_and_marks_pending_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("saved.txt"), b"saved").unwrap();
+        let (mut index, _) = rustsearch_windows::walk(&root, false).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut work = Recovery::default();
+        work.schedule(root, true);
+        let search = SearchIndex::build(&index);
+        let delta = work
+            .step(
+                &index,
+                &search,
+                &[],
+                &[],
+                false,
+                &dir.path().join("excluded"),
+            )
+            .unwrap();
+        drop(search);
+        index.apply_delta(delta).unwrap();
+        assert_eq!(index.counts().0, 1);
+        assert!(
+            index
+                .metadata
+                .pending_refresh
+                .contains(&index.metadata.root_id)
+        );
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn live_directory_changes_jump_ahead_of_startup_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        for n in 0..80 {
+            std::fs::create_dir_all(root.join(format!("dir-{n}"))).unwrap();
+        }
+        let (mut index, _) = rustsearch_windows::walk(&root, false).unwrap();
+        let mut work = Recovery::default();
+        work.schedule(root.clone(), true);
+        std::fs::write(root.join("trigger"), b"x").unwrap();
+        let search = SearchIndex::build(&index);
+        let update = work
+            .step_with_limit(
+                &index,
+                &search,
+                &[event(
+                    EventKind::Create(notify::event::CreateKind::File),
+                    vec![root.join("trigger")],
+                )],
+                &[],
+                false,
+                &dir.path().join("excluded"),
+                1,
+            )
+            .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        let target = *work.hot.back().or_else(|| work.cold.back()).unwrap();
+        let path = PathBuf::from(std::ffi::OsString::from_wide(
+            &index.path_utf16(index.get(target).unwrap()).unwrap(),
+        ))
+        .join("urgent.txt");
+        std::fs::write(&path, b"urgent").unwrap();
+        let search = SearchIndex::build(&index);
+        let update = work
+            .step_with_limit(
+                &index,
+                &search,
+                &[event(
+                    EventKind::Create(notify::event::CreateKind::File),
+                    vec![path],
+                )],
+                &[],
+                false,
+                &dir.path().join("excluded"),
+                1,
+            )
+            .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert_eq!(
+            rustsearch_query::Query {
+                text: "urgent.txt".into(),
+                ..Default::default()
+            }
+            .execute(&index)
+            .total,
+            1,
+            "live changes must not wait behind startup directories"
+        );
+        assert!(!work.is_empty());
+    }
+
+    #[test]
+    fn deleting_an_ancestor_during_recovery_does_not_invalidate_queued_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        std::fs::create_dir_all(root.join("B/deep/deeper")).unwrap();
+        std::fs::write(root.join("B/deep/deeper/old.txt"), b"old").unwrap();
+        let (mut index, _) = rustsearch_windows::walk(&root, false).unwrap();
+        let mut work = Recovery::default();
+        work.schedule(root.clone(), true);
+        for events in [
+            vec![],
+            vec![event(
+                EventKind::Create(notify::event::CreateKind::Any),
+                vec![root.join("B/trigger")],
+            )],
+        ] {
+            let search = SearchIndex::build(&index);
+            let update = work
+                .step_with_limit(
+                    &index,
+                    &search,
+                    &events,
+                    &[],
+                    false,
+                    &dir.path().join("excluded"),
+                    1,
+                )
+                .unwrap();
+            drop(search);
+            index.apply_delta(update).unwrap();
+        }
+        std::fs::remove_dir_all(root.join("B")).unwrap();
+        let search = SearchIndex::build(&index);
+        let update=work.step_with_limit(&index,&search,&[event(EventKind::Remove(notify::event::RemoveKind::Folder),vec![root.join("B")])],&[],false,&dir.path().join("excluded"),32).expect("deleting an ancestor must discard queued descendant jobs instead of forcing a rebuild");
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert_eq!(index.counts().0, 0);
+    }
+
+    #[test]
+    fn bounded_recovery_preserves_queued_directory_moves_and_finishes_all_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        for folder in ["A", "B", "C"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            for file in 0..4 {
+                std::fs::write(root.join(folder).join(format!("file-{file}")), b"x").unwrap();
+            }
+        }
+        let (mut index, _) = rustsearch_windows::walk(&root, false).unwrap();
+        let search = SearchIndex::build(&index);
+        let c = search
+            .child(
+                index.metadata.root_id,
+                &"C".encode_utf16().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .id;
+        let child = search
+            .child(c, &"file-0".encode_utf16().collect::<Vec<_>>())
+            .unwrap()
+            .id;
+        let mut work = Recovery::default();
+        work.schedule(root.clone(), true);
+        let update = work
+            .step_with_limit(
+                &index,
+                &search,
+                &[],
+                &[],
+                false,
+                &dir.path().join("excluded"),
+                1,
+            )
+            .unwrap();
+        drop(search);
+        index.apply_delta(update).unwrap();
+        assert!(!work.is_empty());
+        std::fs::remove_dir_all(root.join("B")).unwrap();
+        std::fs::remove_file(root.join("A/file-0")).unwrap();
+        std::fs::rename(root.join("C"), root.join("Ω")).unwrap();
+        std::fs::create_dir_all(root.join("Ω/new/deep")).unwrap();
+        std::fs::write(root.join("Ω/new/deep/added.txt"), b"new").unwrap();
+        let events = [event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![root.join("C"), root.join("Ω")],
+        )];
+        for step in 0..20 {
+            let search = SearchIndex::build(&index);
+            let update = work
+                .step_with_limit(
+                    &index,
+                    &search,
+                    if step == 0 { &events } else { &[] },
+                    &[],
+                    false,
+                    &dir.path().join("excluded"),
+                    1,
+                )
+                .unwrap();
+            drop(search);
+            index.apply_delta(update).unwrap();
+            if work.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            work.is_empty(),
+            "bounded recovery must finish rather than restart its root"
+        );
+        assert!(
+            work.parent_runs.is_none(),
+            "temporary lookup memory must be released"
+        );
+        assert_eq!(
+            index.path_utf16(index.get(child).unwrap()).unwrap(),
+            root.join("Ω/file-0")
+                .canonicalize()
+                .unwrap()
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>()
+        );
+        let (fresh, _) = rustsearch_windows::walk(&root, false).unwrap();
+        let paths = |index: &Index| {
+            index
+                .live_entries()
+                .map(|e| index.path_utf16(e).unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(paths(&index), paths(&fresh));
+    }
+
     #[test]
     fn directory_metadata_retries_pending_contents() {
         let dir = tempfile::tempdir().unwrap();

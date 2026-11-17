@@ -85,6 +85,8 @@ pub struct SourceInfo {
     pub volumes: Vec<VolumeSummary>,
     pub warnings: Vec<String>,
     pub live: bool,
+    #[serde(default)]
+    pub recovering: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
@@ -145,10 +147,13 @@ impl Mailbox {
         }
     }
     fn poll(&self) -> (bool, Option<Request>) {
+        self.poll_timeout(std::time::Duration::from_millis(250))
+    }
+    fn poll_timeout(&self, timeout: std::time::Duration) -> (bool, Option<Request>) {
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut pending = if pending.request.is_none() && !pending.stopped {
             self.wake
-                .wait_timeout(pending, std::time::Duration::from_millis(250))
+                .wait_timeout(pending, timeout)
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         } else {
@@ -290,6 +295,7 @@ impl Engine {
                         )
                         .ok()
                     });
+                    let resumed=matches!(&request,Request::Open{..}) && session_live.is_some();
                     let (generation, search, loaded) = match request {
                         Request::Open {
                             path,
@@ -363,6 +369,12 @@ impl Engine {
                             let mut active_search = search;
                             let mut last_refresh = Instant::now();
                             let mut last_watch_stats=None;
+                            let mut recoveries:Vec<_>=loaded.indexes.iter().map(|index| {
+                                let mut work=crate::live::Recovery::default();
+                                if resumed && index.metadata.source!="ntfs-usn" {work.schedule(PathBuf::from(&index.metadata.root),true);}
+                                work
+                            }).collect();
+                            let mut counts:Vec<_>=loaded.indexes.iter().map(Index::counts).collect();
                             'session: loop {
                                 let start = Instant::now();
                                 let mut prepared = Vec::new();
@@ -421,12 +433,12 @@ impl Engine {
                                     volumes: vec![],
                                     warnings: loaded.warnings.clone(),
                                     live: session_live.is_some(),
+                                    recovering: recoveries.iter().any(|work|!work.is_empty()),
                                 };
                                 if let Some(watch) = &watch {
                                     info.warnings.extend(watch.errors.clone());
                                 }
-                                for (index, table) in loaded.indexes.iter().zip(&prepared) {
-                                    let (records, folders, sized, _) = index.counts();
+                                for ((index, table), &(records, folders, sized, _)) in loaded.indexes.iter().zip(&prepared).zip(&counts) {
                                     info.records += records;
                                     info.folders += folders;
                                     info.files += records - folders;
@@ -443,7 +455,7 @@ impl Engine {
                                         reparse: index.metadata.reparse_points_not_followed,
                                     });
                                 }
-                                let info = Arc::new(info);
+                                let mut info = Arc::new(info);
                                 worker.loading.store(false,Ordering::Release);
                                 respond(
                                     &loaded.indexes,
@@ -455,8 +467,9 @@ impl Engine {
                                     reply,
                                 );
                                 let pending_deltas = loop {
+                                    let background_active=recoveries.iter().any(|work|!work.is_empty()) && session_live.as_ref().is_some_and(|(_,control)|!control.paused.load(Ordering::Acquire));
                                     let (stopped, request) = if session_live.is_some() {
-                                        worker.poll()
+                                        if background_active {worker.poll_timeout(std::time::Duration::ZERO)}else{worker.poll()}
                                     } else {
                                         match worker.take() {
                                             Some(r) => (false, Some(r)),
@@ -495,7 +508,7 @@ impl Engine {
                                         continue;
                                     }
                                     // Live work gets a turn even while queries arrive faster than poll().
-                                    if last_refresh.elapsed() < std::time::Duration::from_millis(250) {continue;}
+                                    if !background_active && last_refresh.elapsed() < std::time::Duration::from_millis(250) {continue;}
                                     let events = watch
                                         .as_ref()
                                         .map_or_else(crate::live::Changes::default, |w| w.take());
@@ -507,14 +520,14 @@ impl Engine {
                                     }
                                     let native_due=last_refresh.elapsed()>=std::time::Duration::from_secs(2)
                                         && loaded.indexes.iter().any(|i|i.metadata.source=="ntfs-usn");
-                                    if events.is_empty() && !native_due {continue;}
+                                    if events.is_empty() && !native_due && !background_active {continue;}
                                     let changes=(|| -> Result<Vec<Option<rustsearch_core::Delta>>> {
                                         let mut changes=vec![];
-                                        for (index, bound) in loaded.indexes.iter().zip(&prepared) {
+                                        for ((index, bound),recovery) in loaded.indexes.iter().zip(&prepared).zip(&mut recoveries) {
                                             let mut delta=if index.metadata.source=="ntfs-usn" {
                                                 rustsearch_windows::refresh(index,control.sizes.load(Ordering::Acquire))?.0
                                             } else {
-                                                crate::live::changes(index,bound,&events.events,&events.folders,control.sizes.load(Ordering::Acquire),exclude)?
+                                                recovery.step(index,bound,&events.events,&events.folders,control.sizes.load(Ordering::Acquire),exclude)?
                                             };
                                             if index.metadata.source=="ntfs-usn" {crate::live::exclude_native_storage(index,&mut delta,exclude);}
                                             let empty=delta.records.is_empty()
@@ -527,7 +540,14 @@ impl Engine {
                                     last_refresh=Instant::now();
                                     // Ordinary log/attribute notifications often do not change indexed
                                     // fields. Keep borrowing the same tables and statistics in that case.
-                                    if changes.as_ref().is_ok_and(|items|items.iter().all(Option::is_none)) {continue;}
+                                    if changes.as_ref().is_ok_and(|items|items.iter().all(Option::is_none)) {
+                                        let recovering=recoveries.iter().any(|work|!work.is_empty());
+                                        if info.recovering!=recovering {
+                                            let mut next_info=(*info).clone();next_info.recovering=recovering;info=Arc::new(next_info);
+                                            respond(&loaded.indexes,&prepared,info.clone(),active_generation,active_search.clone(),&worker,reply);
+                                        }
+                                        continue;
+                                    }
                                     break changes;
                                 };
                                 let tables = prepared
@@ -540,11 +560,13 @@ impl Engine {
                                     (|| -> Result<Vec<rustsearch_query::SearchTables>> {
                                         let mut retained_tables = vec![];
                                         let deltas=pending_deltas?;
-                                        for (((index,path),table),delta) in loaded.indexes.iter_mut().zip(&loaded.paths).zip(tables).zip(deltas) {
+                                        for ((((index,path),table),delta),counts) in loaded.indexes.iter_mut().zip(&loaded.paths).zip(tables).zip(deltas).zip(&mut counts) {
                                             if let Some(delta)=delta {
                                                 let guard=rustsearch_storage::WriteGuard::acquire(path)?;
                                                 rustsearch_storage::append_delta(&guard,index,&delta)?;
+                                                let updated_counts=delta_counts(index,&delta,*counts);
                                                 index.apply_delta(delta)?;
+                                                *counts=updated_counts;
                                             }
                                             retained_tables.push(table);
                                         }
@@ -621,6 +643,28 @@ impl Engine {
         self.mailbox.wake.notify_one();
     }
 }
+fn delta_counts(
+    index: &Index,
+    delta: &rustsearch_core::Delta,
+    mut counts: (usize, usize, usize, usize),
+) -> (usize, usize, usize, usize) {
+    for (&id, record) in &delta.records {
+        if let Some(old) = index.get(id) {
+            counts.0 -= 1;
+            counts.1 -= usize::from(old.flags & DIRECTORY != 0);
+            counts.2 -= usize::from(old.flags & (DIRECTORY | SIZE_KNOWN) == SIZE_KNOWN);
+            counts.3 -= usize::from(old.flags & rustsearch_core::REPARSE != 0);
+        }
+        if let Some(record) = record {
+            counts.0 += 1;
+            counts.1 += usize::from(record.flags & DIRECTORY != 0);
+            counts.2 += usize::from(record.flags & DIRECTORY == 0 && record.size.is_some());
+            counts.3 += usize::from(record.flags & rustsearch_core::REPARSE != 0);
+        }
+    }
+    counts
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         self.mailbox
@@ -1148,6 +1192,55 @@ mod tests {
             2,
         );
         assert!(matches!(reply(&rx, 2), Event::Error { .. }));
+    }
+
+    #[test]
+    fn incremental_counts_match_full_counts_after_mixed_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rsidx");
+        fixture(&path);
+        let mut index = rustsearch_storage::load(&path).unwrap();
+        let make = |id, parent, flags, size| {
+            Some(Record {
+                id,
+                parent,
+                flags,
+                size,
+                usn: 0,
+                name: format!("item-{id}").encode_utf16().collect(),
+            })
+        };
+        let mut records: std::collections::BTreeMap<_, _> =
+            index.live_entries().map(|e| (e.id, None)).collect();
+        records.extend([
+            (1000, make(1000, 1, DIRECTORY, None)),
+            (1001, make(1001, 1000, 0, Some(0))),
+            (1002, make(1002, 1000, 0, None)),
+            (
+                1003,
+                make(1003, 1, DIRECTORY | rustsearch_core::REPARSE, None),
+            ),
+        ]);
+        for records in [
+            records,
+            std::collections::BTreeMap::from([
+                (1001, None),
+                (1002, make(1002, 1, 0, Some(17))),
+                (1003, make(1003, 1, 0, Some(3))),
+                (1004, make(1004, 1, DIRECTORY, None)),
+                (1005, make(1005, 1004, 0, Some(0))),
+            ]),
+        ] {
+            let delta = rustsearch_core::Delta {
+                previous_sequence: index.log_sequence,
+                previous_checkpoint: index.metadata.checkpoint.clone(),
+                metadata: index.metadata.clone(),
+                records,
+            };
+            let counts = delta_counts(&index, &delta, index.counts());
+            index.apply_delta(delta).unwrap();
+            assert_eq!(counts, index.counts());
+        }
     }
 
     #[test]

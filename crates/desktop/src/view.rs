@@ -985,6 +985,8 @@ impl Workspace {
                             .child(if source.live {
                                 if self.runtime.as_ref().is_some_and(|s| s.profile.paused) {
                                     "Updates paused"
+                                } else if source.recovering {
+                                    "Syncing"
                                 } else {
                                     "Live updates"
                                 }
