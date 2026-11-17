@@ -150,7 +150,8 @@ def main():
     hashes = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(stage).as_posix()}" for p in sorted(stage.rglob("*")) if p.is_file()]
     (stage / "SHA256SUMS.txt").write_text("\n".join(hashes) + "\n", encoding="utf-8")
     archive = output / f"{name}.zip"
-    with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_file:
+    # Registry archives may use Unix-epoch mtimes, before ZIP's 1980 lower bound.
+    with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9, strict_timestamps=False) as zip_file:
         for file in sorted(stage.rglob("*")):
             if file.is_file():
                 zip_file.write(file, file.relative_to(output))
