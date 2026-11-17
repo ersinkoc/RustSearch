@@ -295,6 +295,15 @@ fn metadata(info: &VolumeInfo, source: &str, root: String, root_id: u64) -> Meta
 
 /// Normal directory enumeration, deliberately separate from the privileged NTFS backend.
 pub fn walk(root: &Path, sizes: bool) -> Result<(Index, ScanStats)> {
+    walk_controlled(root, sizes, |_| true)
+}
+
+/// Cooperatively stop folder traversal; the callback also observes completed record counts.
+pub fn walk_controlled(
+    root: &Path,
+    sizes: bool,
+    mut keep_going: impl FnMut(u64) -> bool,
+) -> Result<(Index, ScanStats)> {
     let root = root.canonicalize().context("resolve scan root")?;
     ensure!(root.is_dir(), "scan root must be a directory");
     let root_meta = std::fs::symlink_metadata(&root)?;
@@ -313,6 +322,7 @@ pub fn walk(root: &Path, sizes: bool) -> Result<(Index, ScanStats)> {
     let mut stack = vec![(root, 1u64)];
     let mut next = 2u64;
     while let Some((path, parent)) = stack.pop() {
+        ensure!(keep_going(next - 2), "Folder indexing cancelled");
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(_) => {
@@ -321,6 +331,7 @@ pub fn walk(root: &Path, sizes: bool) -> Result<(Index, ScanStats)> {
             }
         };
         for entry in entries {
+            ensure!(keep_going(next - 2), "Folder indexing cancelled");
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => {
@@ -717,6 +728,20 @@ pub fn process_sample() -> Result<ProcessSample> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn controlled_walk_can_cancel_without_modifying_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["first.txt", "second.txt", "third.txt"] {
+            std::fs::write(dir.path().join(name), b"unchanged").unwrap();
+        }
+        let result = super::walk_controlled(dir.path(), true, |records| records < 2);
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(
+            std::fs::read(dir.path().join("first.txt")).unwrap(),
+            b"unchanged"
+        );
+        assert_eq!(super::walk(dir.path(), true).unwrap().0.entries.len(), 3);
+    }
     use super::*;
     #[test]
     fn checkpoint_rejects_wrap_recreation_and_future_cursor() {

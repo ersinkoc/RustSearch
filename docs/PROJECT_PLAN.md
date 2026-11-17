@@ -1,6 +1,6 @@
 # Product and technical plan
 
-Updated 17 November 2026. Version **0.0.1** is a working Windows CLI prototype. This document describes the intended product, not a claim that all planned features exist. See [current CLI coverage](CLI.md) and [measured results](MEMORY_RESULTS.md).
+Updated 17 November 2026. Version **0.0.1** includes a working Windows CLI prototype and a GPUI desktop alpha. This document describes the intended product, not a claim that all planned features exist. See [current CLI coverage](CLI.md), the [desktop guide](DESKTOP.md), and [measured results](MEMORY_RESULTS.md).
 
 ## Product scope
 
@@ -37,7 +37,7 @@ Content/OCR/semantic search, duplicate detection, continuous hashing, automatic 
 | --- | --- |
 | Core | Rust with a pinned stable MSVC toolchain and compact data structures |
 | Windows APIs | Narrow `windows-sys` FFI boundary with required features only |
-| UI candidate | Win32 virtual ListView and Direct2D map; validate accessibility and memory before committing |
+| UI | Rust GPUI with virtual results and a single background index owner; disk map and accessibility acceptance remain future work |
 | Index | Versioned snapshot, shared name/key pools, bounded committed delta layer |
 | Updates | NTFS USN journal plus targeted metadata refresh |
 | Settings | Small local configuration; no general-purpose database required on the hot path |
@@ -105,7 +105,7 @@ Measure normal operation, mutation bursts, and old/new generation overlap during
 | E: beta/distribution | Installer/update/helper lifecycle | Windows acceptance and versioned competitor comparisons |
 | F: expansion | Other filesystems, NAS, optional content search | Separate coverage and resource budget for each mode |
 
-The CLI has implemented parts of A and B. GUI, parser, full size coverage, allocated-space accuracy, and disk analysis remain unfinished. Content search should use a separate opt-in index for selected folders/types; OCR/semantic search must not become a mandatory metadata cost. Estimate delivery dates after size-collection and UI feasibility are measured.
+The CLI has implemented parts of A and B. The GPUI desktop alpha implements virtual results, file actions, filters, largest files, themes, and an index overview from D. The parser, tray/global shortcut, accessibility acceptance, full size coverage, allocated-space accuracy, and disk analysis remain unfinished. Content search should use a separate opt-in index for selected folders/types; OCR/semantic search must not become a mandatory metadata cost. Estimate delivery dates after size-collection and UI-inclusive resource budgets are measured.
 
 The competitive hypothesis is faster transitions between search and disk analysis with compact metadata, selective helpers, and clear freshness. A 2x p95 improvement in comparable large-index query classes is an engineering aim, not a guarantee. Do not omit slower query classes or ignore CPU/RAM/I/O tradeoffs. See the [benchmark protocol](BENCHMARKS.md).
 

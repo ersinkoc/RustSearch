@@ -8,12 +8,14 @@ The development environment uses Rust/Cargo 1.93.0, Windows 11 x64, and MSVC.
 
 ```powershell
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-cargo build --release --bins --examples --locked
+cargo clippy --workspace --all-targets --release --locked -- -D warnings
+cargo test --workspace --release --locked
+cargo build --workspace --release --bins --examples --locked
 ```
 
 Executable: `target\release\rustsearch.exe`.
+
+The workspace defaults to the CLI for `cargo build` and `cargo run`. Use `-p rustsearch-desktop` for the [GPUI desktop app](DESKTOP.md), or `--workspace` to build both.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -22,6 +24,7 @@ Executable: `target\release\rustsearch.exe`.
 | query | Sorted name groups, character/trigram summaries, extension and known-size ordering |
 | storage | CRC-checked snapshots and bounded delta log, checkpoints, writer locks, private Windows DACL |
 | cli | Commands, JSON reports, warm benchmarks, idle measurements |
+| desktop | GPUI interface, bounded background search worker, folder indexing, file actions |
 
 ## Indexing
 
@@ -124,6 +127,6 @@ The script creates its own fixture under `.temp_files`, enumerates the full nati
 
 Snapshots and caches use atomic temporary-file publication and Windows replacement. Before writing data, an inheritance-disabled DACL grants access to the current user, SYSTEM, and Administrators. CRC32 detects accidental corruption; it is not authentication. Snapshots and result rows contain sensitive filenames and directory structure. Raw local evidence is not published.
 
-Native coverage is one canonical name per full file reference. Additional hard links, allocated/compressed/sparse space, alternate stream totals, date/path search, GUI, folder totals, and disk-space maps remain outside the implemented scope. USN parser support is V2 only; unsupported versions fail instead of being silently misparsed. No Everything speed/RAM superiority claim has been established.
+Native coverage is one canonical name per full file reference. Additional hard links, allocated/compressed/sparse space, alternate stream totals, date/path search, folder totals, and disk-space maps remain outside the implemented scope. USN parser support is V2 only; unsupported versions fail instead of being silently misparsed. No Everything speed/RAM superiority claim has been established.
 
 See [memory results](MEMORY_RESULTS.md), [cache validation results](CACHE_VALIDATION_RESULTS.md), and [benchmark targets](BENCHMARKS.md). API references: [USN enumeration](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_enum_usn_data), [current USN read](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_read_file_usn_data), [process memory](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex).

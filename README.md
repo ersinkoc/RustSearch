@@ -2,7 +2,7 @@
 
 A Windows file-search and disk-space analysis project focused on fast metadata queries and low resource use.
 
-**Version: 0.0.1 — CLI feasibility prototype.** Native NTFS/USN indexing, persistent snapshots, cached name queries, size filters, committed delta updates, and resource measurements are implemented. The desktop UI and disk-space map are planned.
+**Version: 0.0.1 — CLI prototype and GPUI desktop alpha.** Native NTFS/USN indexing, persistent snapshots, cached name queries, size filters, committed delta updates, and resource measurements are implemented. The Rust desktop app adds virtual results, keyboard navigation, file details, largest files, and dark/light appearances. The disk-space map is still planned.
 
 The first release scope is file/folder search plus disk-space analysis. Content search comes later. All project documentation and user-facing text are in English.
 
@@ -14,6 +14,9 @@ The first release scope is file/folder search plus disk-space analysis. Content 
 - Persistent search tables and small delta overlays that preserve the base snapshot and cache.
 - Full file references and original UTF-16 names, including unpaired surrogates.
 - JSON reports for startup, warm queries, CPU, private commit, working set, and process I/O.
+- A native GPUI interface that opens existing indexes or indexes accessible folders without elevation.
+
+![RustSearch desktop using a generated test fixture](docs/assets/desktop-dark.jpg)
 
 Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates a native snapshot; there is no background service yet. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
 
@@ -33,6 +36,15 @@ New-Item -ItemType Directory -Path .temp_files -Force
 .\target\release\rustsearch.exe index --volume D: --output .temp_files\native.rsidx
 .\target\release\rustsearch.exe refresh --index .temp_files\native.rsidx --sizes
 ```
+
+Build and launch the desktop app separately:
+
+```powershell
+cargo build -p rustsearch-desktop --release --locked
+.\target\release\rustsearch-desktop.exe --index .temp_files\local.rsidx
+```
+
+Use **Index a folder** for a normal-user scan, or **Open index** for an existing CLI snapshot. The desktop opens the latest committed delta view and reuses the existing search cache. Its reload button rereads that snapshot; it does not run a privileged NTFS refresh. See the [desktop guide](docs/DESKTOP.md) and [verification results](docs/DESKTOP_RESULTS.md).
 
 ## Performance evidence
 
@@ -55,6 +67,8 @@ The common one-character substring follow-up reduced the `a` query from 12.04 to
 ## Project documentation
 
 - [CLI commands and limitations](docs/CLI.md)
+- [Desktop app and shortcuts](docs/DESKTOP.md)
+- [Desktop visual and correctness checks](docs/DESKTOP_RESULTS.md)
 - [Product and technical plan](docs/PROJECT_PLAN.md)
 - [Benchmark protocol and engineering targets](docs/BENCHMARKS.md)
 
