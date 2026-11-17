@@ -117,15 +117,30 @@ def main():
         if not files and package["license"] != "CC0-1.0":
             vcs_file = directory / ".cargo_vcs_info.json"
             vcs = json.loads(vcs_file.read_text()) if vcs_file.exists() else {}
-            content, source_url = upstream_license(source_url, vcs.get("git", {}).get("sha1"))
-            (destination / "LICENSE-upstream.txt").write_bytes(content)
+            try:
+                content, source_url = upstream_license(source_url, vcs.get("git", {}).get("sha1"))
+                (destination / "LICENSE-upstream.txt").write_bytes(content)
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
+                # A few legacy crates never shipped a standalone notice, even in
+                # their repository. Retain their published declaration verbatim.
+                shutil.copy2(directory / "Cargo.toml", destination / "UPSTREAM-Cargo.toml")
+                if (directory / "README.md").exists():
+                    shutil.copy2(directory / "README.md", destination / "UPSTREAM-README.md")
+                source_url += " (published manifest/README declaration; standalone license unavailable; see standard license texts)"
         return {"name": package["name"], "version": package["version"], "license": package["license"], "authors": package["authors"], "source": source_url}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         inventory = list(pool.map(notices, external))
     lucide, lucide_url = upstream_license("https://github.com/lucide-icons/lucide", "main")
     (stage / "licenses" / "Lucide-LICENSE.txt").write_bytes(lucide)
-    lines = ["# Third-party notices", "", "Conservative Cargo.lock inventory for the Windows workspace, including build and test tooling. License files are under licenses/. Lucide icon notices are included separately for the embedded GPUI Component icons.", "", f"Lucide license source: {lucide_url}", ""]
+    standard = stage / "licenses" / "standard"
+    standard.mkdir()
+    for identifier in ("MIT", "Apache-2.0", "CC0-1.0"):
+        url = f"https://raw.githubusercontent.com/spdx/license-list-data/main/text/{identifier}.txt"
+        (standard / f"{identifier}.txt").write_bytes(fetch(url))
+    lines = ["# Third-party notices", "", "Conservative Cargo.lock inventory for the Windows workspace, including build and test tooling. License files are under licenses/. Lucide icon notices are included separately for the embedded GPUI Component icons. Standard MIT, Apache-2.0, and CC0 text forms from SPDX are included under licenses/standard; author attributions and original declarations are retained separately when a legacy crate has no standalone notice. A standard form is not a newly authored copyright notice.", "", f"Lucide license source: {lucide_url}", ""]
     for p in inventory:
         lines.extend([f"## {p['name']} {p['version']}", "", f"Declared license: {p['license']}", "", f"Source: {p['source']}", "", "Authors: " + ("; ".join(p["authors"]) or "See the upstream license/source notices."), ""])
     (stage / "THIRD_PARTY_NOTICES.md").write_text("\n".join(lines), encoding="utf-8")

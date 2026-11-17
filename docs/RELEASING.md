@@ -23,6 +23,8 @@ python scripts/package-release.py --output .temp_files/release-0.0.1/package
 
 Use a new output directory for each attempt. Existing artifacts are never overwritten or deleted. The ZIP contains the desktop/CLI executables, portable/release notes, dependency attributions and license files, build provenance, and hashes for each file. The adjacent `SHA256SUMS.txt` covers the ZIP. Do not include snapshots, catalogs, worker credentials, user settings, or raw disk metadata.
 
+For legacy crates with no standalone license in either their published source or repository, the package preserves the published manifest/README declaration and author attribution and includes standard SPDX license text forms. Such cases are labeled in the dependency inventory rather than assigned an invented copyright notice.
+
 Extract the ZIP to a new folder, verify every file checksum and provenance commit, and run the extracted CLI on a generated folder. Compare both extracted executable hashes to the validated binaries. This byte-identity check connects GUI acceptance to the distributed executable. Inspect PE dependencies and document external runtime prerequisites. An existing-machine smoke check is separate from clean-machine acceptance.
 
 ## Publish
