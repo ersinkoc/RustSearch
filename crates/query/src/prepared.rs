@@ -133,6 +133,15 @@ impl<'a> SearchIndex<'a> {
     }
     /// Find a child without allocating all exact-name matches or materializing paths.
     pub fn child(&self, parent: u64, name: &[u16]) -> Option<&'a Entry> {
+        self.child_in_ranges(parent, name, std::iter::once((0, u32::MAX)))
+    }
+    /// Restrict immutable postings to known parent row runs; live overlays remain visible.
+    pub fn child_in_ranges(
+        &self,
+        parent: u64,
+        name: &[u16],
+        ranges: impl Clone + IntoIterator<Item = (u32, u32)>,
+    ) -> Option<&'a Entry> {
         let key = rustsearch_core::search_key(name);
         let start = self
             .groups
@@ -142,16 +151,24 @@ impl<'a> SearchIndex<'a> {
             .iter()
             .take_while(|g| g.key(self.index) == key.as_slice())
         {
-            for &row in &self.postings[group.start as usize..(group.start + group.len) as usize] {
-                if self.is_shadowed(row) {
+            let postings = &self.postings[group.start as usize..(group.start + group.len) as usize];
+            for (first, end) in ranges.clone() {
+                if first >= end {
                     continue;
                 }
-                let entry = self.entry(row);
-                if entry.parent == parent {
-                    if self.index.name(entry) == name {
-                        return Some(entry);
+                let from = postings.partition_point(|row| *row < first);
+                let to = postings.partition_point(|row| *row < end);
+                for &row in &postings[from..to] {
+                    if self.is_shadowed(row) {
+                        continue;
                     }
-                    folded = Some(entry);
+                    let entry = self.entry(row);
+                    if entry.parent == parent {
+                        if self.index.name(entry) == name {
+                            return Some(entry);
+                        }
+                        folded = Some(entry);
+                    }
                 }
             }
         }

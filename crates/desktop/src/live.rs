@@ -359,6 +359,43 @@ struct Edit<'a> {
     sizes: bool,
     children: HashMap<u64, HashMap<Vec<u16>, u64>>,
     removed: HashSet<u64>,
+    parent_runs: Option<Vec<ParentRun>>,
+}
+struct ParentRun {
+    parent: u64,
+    first: u32,
+    end: u32,
+}
+fn parent_runs(index: &Index) -> Option<Vec<ParentRun>> {
+    // Accessible snapshots enumerate each parent's children together. Keep only row
+    // boundaries, capped at 64 MiB and dropped after this recovery transaction.
+    let rows = &index.entries;
+    if rows.is_empty() {
+        return Some(vec![]);
+    }
+    let count = 1 + rows
+        .windows(2)
+        .filter(|pair| pair[0].parent != pair[1].parent)
+        .count();
+    if rows.len() >= u32::MAX as usize
+        || count > 64 * 1024 * 1024 / std::mem::size_of::<ParentRun>()
+    {
+        return None;
+    }
+    let mut runs = Vec::with_capacity(count);
+    let mut first = 0;
+    for end in 1..=rows.len() {
+        if end == rows.len() || rows[first].parent != rows[end].parent {
+            runs.push(ParentRun {
+                parent: rows[first].parent,
+                first: first as u32,
+                end: end as u32,
+            });
+            first = end;
+        }
+    }
+    runs.sort_unstable_by_key(|run| (run.parent, run.first));
+    Some(runs)
 }
 impl Edit<'_> {
     fn child(&self, parent: u64, name: &[u16]) -> Option<u64> {
@@ -369,8 +406,23 @@ impl Edit<'_> {
         {
             return Some(*id);
         }
-        self.search
-            .child(parent, name)
+        let entry = if let Some(runs) = &self.parent_runs {
+            let first = runs.partition_point(|run| run.parent < parent);
+            let end = runs.partition_point(|run| run.parent <= parent);
+            if end - first > 64 {
+                // Fragmented legacy layouts can have more runs than name candidates.
+                self.search.child(parent, name)
+            } else {
+                self.search.child_in_ranges(
+                    parent,
+                    name,
+                    runs[first..end].iter().map(|run| (run.first, run.end)),
+                )
+            }
+        } else {
+            self.search.child(parent, name)
+        };
+        entry
             .filter(|e| match self.records.get(&e.id) {
                 Some(Some(record)) => record.parent == parent && record.name == name,
                 Some(None) => false,
@@ -464,6 +516,15 @@ impl Edit<'_> {
         }
     }
     fn reconcile(&mut self, folders: &[(PathBuf, bool)], exclude: &Path) -> Result<()> {
+        let relevant: Vec<_> = folders
+            .iter()
+            .filter(|(path, _)| {
+                is_within(path, Path::new(&self.index.metadata.root)) && !is_within(path, exclude)
+            })
+            .collect();
+        if relevant.len() >= 64 || relevant.iter().any(|(_, recursive)| *recursive) {
+            self.parent_runs = parent_runs(self.index);
+        }
         let mut todo: std::collections::VecDeque<_> = folders.iter().cloned().collect();
         let mut scanned = HashMap::new();
         let mut present = HashSet::new();
@@ -706,6 +767,7 @@ pub fn changes(
         sizes,
         children: HashMap::new(),
         removed: HashSet::new(),
+        parent_runs: None,
     };
     let mut recovery = Queue::default();
     for (path, recursive) in folders {
@@ -1019,6 +1081,7 @@ mod tests {
             sizes: true,
             children: HashMap::new(),
             removed: HashSet::new(),
+            parent_runs: None,
         };
         let file = root.join("temporary.txt");
         std::fs::write(&file, b"temporary").unwrap();
@@ -1077,6 +1140,7 @@ mod tests {
             sizes: true,
             children: HashMap::new(),
             removed: HashSet::new(),
+            parent_runs: None,
         };
         let old = dir.path().join("old.txt");
         let new = dir.path().join("new.txt");

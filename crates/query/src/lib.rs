@@ -152,6 +152,87 @@ mod tests {
         i
     }
     #[test]
+    fn child_row_ranges_preserve_case_shadowing_and_moved_or_inserted_overlays() {
+        let mut index = fixture();
+        for (id, parent, name, flags) in [
+            (1000, 1, "shared", DIRECTORY),
+            (1001, 1000, "Report.PDF", 0),
+            (1002, 1000, "common.txt", 0),
+            (1003, 5, "common.txt", 0),
+            (1004, 1000, "case.txt", 0),
+        ] {
+            index
+                .push(Record {
+                    id,
+                    parent,
+                    usn: 0,
+                    size: None,
+                    flags,
+                    name: name.encode_utf16().collect(),
+                })
+                .unwrap();
+        }
+        index.finish().unwrap();
+        for generation in 0..2 {
+            let search = SearchIndex::build(&index);
+            for parent in [1, 5, 1000, 2001, 9999] {
+                let rows: Vec<_> = index
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.parent == parent)
+                    .map(|(row, _)| (row as u32, row as u32 + 1))
+                    .collect();
+                for name in [
+                    "Report.PDF",
+                    "REPORT.PDF",
+                    "report.pdf",
+                    "common.txt",
+                    "COMMON.TXT",
+                    "missing",
+                    "inserted.txt",
+                    "moved.txt",
+                ] {
+                    let name: Vec<_> = name.encode_utf16().collect();
+                    assert_eq!(
+                        search.child(parent, &name).map(|e| e.id),
+                        search
+                            .child_in_ranges(parent, &name, rows.iter().copied())
+                            .map(|e| e.id)
+                    );
+                }
+            }
+            drop(search);
+            if generation == 0 {
+                let make = |id, parent, name: &str, flags| {
+                    Some(Record {
+                        id,
+                        parent,
+                        usn: 0,
+                        size: None,
+                        flags,
+                        name: name.encode_utf16().collect(),
+                    })
+                };
+                index
+                    .apply_delta(rustsearch_core::Delta {
+                        previous_sequence: index.log_sequence,
+                        previous_checkpoint: None,
+                        metadata: index.metadata.clone(),
+                        records: std::collections::BTreeMap::from([
+                            (2, None),
+                            (1001, make(1001, 5, "moved.txt", 0)),
+                            (2000, make(2000, 1000, "inserted.txt", 0)),
+                            (2001, make(2001, 1, "fresh", DIRECTORY)),
+                            (2002, make(2002, 2001, "inserted.txt", 0)),
+                        ]),
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn detached_tables_rebind_live_deltas_and_reject_another_base() {
         let mut index = fixture();
         index.snapshot_identity = Some([7; 24]);
