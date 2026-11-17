@@ -14,6 +14,7 @@ import subprocess
 import tomllib
 import urllib.parse
 import urllib.request
+import urllib.error
 import zipfile
 
 
@@ -38,8 +39,18 @@ def upstream_license(repository, revision):
     if parsed.hostname == "github.com" and len(parts) >= 2:
         repository = "/".join(parts[:2])
         url = f"https://api.github.com/repos/{repository}/license?ref={urllib.parse.quote(revision)}"
-        result = json.loads(fetch(url))
-        return base64.b64decode(result["content"]), result["html_url"]
+        try:
+            result = json.loads(fetch(url))
+            source = result["html_url"]
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            # Some published crates declare a license but their historical Git
+            # revision has no license file. Preserve the actual upstream notice
+            # and label this fallback rather than inventing a copyright notice.
+            result = json.loads(fetch(f"https://api.github.com/repos/{repository}/license"))
+            source = result["html_url"] + " (current upstream notice; historical revision has no standalone license file)"
+        return base64.b64decode(result["content"]), source
     if parsed.hostname == "gitlab.redox-os.org":
         url = f"https://gitlab.redox-os.org/{'/'.join(parts[:2])}/-/raw/{revision}/LICENSE"
         return fetch(url), url
