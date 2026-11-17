@@ -15,6 +15,8 @@ The first release scope is file/folder search plus disk-space analysis. Content 
 - Full file references and original UTF-16 names, including unpaired surrogates.
 - JSON reports for startup, warm queries, CPU, private commit, working set, and process I/O.
 - A native GPUI interface that opens existing indexes or indexes accessible folders without elevation.
+- A drive-selection screen, persistent computer catalogs, combined multi-drive queries, and per-drive coverage reporting.
+- An embedded Windows application icon and file-type symbols for easier scanning of results.
 
 ![RustSearch desktop using a generated test fixture](docs/assets/desktop-dark.jpg)
 
@@ -44,7 +46,7 @@ cargo build -p rustsearch-desktop --release --locked
 .\target\release\rustsearch-desktop.exe --index .temp_files\local.rsidx
 ```
 
-Use **Index a folder** for a normal-user scan, or **Open index** for an existing CLI snapshot. The desktop opens the latest committed delta view and reuses the existing search cache. Its reload button rereads that snapshot; it does not run a privileged NTFS refresh. See the [desktop guide](docs/DESKTOP.md) and [verification results](docs/DESKTOP_RESULTS.md).
+Choose **This computer** to select local drives and index them together, **Index a folder** for a smaller normal-user scan, or **Open index** for a snapshot/computer catalog. Accessible files works without elevation; Fast NTFS requires running the app as administrator. The desktop opens committed delta views and reuses existing search caches. Reload rereads the source; it does not run a USN refresh. See the [desktop guide](docs/DESKTOP.md) and [verification results](docs/DESKTOP_RESULTS.md).
 
 ## Performance evidence
 

@@ -19,7 +19,33 @@ By default, the app restores the last successfully opened index and appearance. 
 
 Choose **Index a folder** to scan accessible metadata and logical file sizes without elevation. Reparse targets are not followed. The app saves a private snapshot and prepares its search tables. Cancellation is cooperative: it stops traversal at an entry boundary; an operation already inside snapshot writing or cache preparation must finish that phase before the worker can stop. Source files are never changed by indexing.
 
-Choose **Open index** for a `.rsidx` snapshot, including an existing native NTFS CLI index. Keep its matching `.delta` alongside it. The reload icon opens the latest committed view and rebinds the immutable base search cache. It does not watch the filesystem, run `refresh`, or elevate the process. Continue using the CLI for native-volume indexing and USN refresh.
+Choose **Open index** for a `.rsidx` snapshot or a `.rscatalog` computer catalog. Keep each snapshot's matching `.delta` alongside it. The reload icon opens the latest committed views and rebinds their immutable base search caches. It does not watch the filesystem, run `refresh`, or elevate the process. CLI-native snapshots remain compatible.
+
+## Index this computer
+
+Open **This computer**, or choose **Index this computer** on the welcome screen. Ready local fixed drives are selected initially; removable drives can be included explicitly. Each drive shows its filesystem, type, free space, and total capacity. Refresh drives after connecting media. These capacity bars describe Windows volume space, not indexed folder totals.
+
+- **Accessible files** scans selected drives without administrator access. Protected entries may be skipped and the scan can take considerably longer than NTFS enumeration.
+- **Fast NTFS** uses native metadata enumeration on NTFS drives. Run the executable as administrator yourself when using this mode. It requires an existing USN journal, never creates one, and reports failed drives instead of silently changing the scan method. File actions inherit that process's permissions.
+- **Collect logical file sizes** enables size queries and Largest files. Disable it for a faster name index. Native size collection can be expensive on large volumes; unknown sizes are never treated as zero.
+
+The scan processes drives sequentially and publishes a separate private snapshot for each successful drive. A private `computer.rscatalog` under `%LOCALAPPDATA%\RustSearch\computer-*` records the snapshot paths and failed-drive messages. It restores as one searchable source on the next launch. The original full file ID is scoped by its source index; identical IDs on two drives remain separate results.
+
+**All locations** searches every loaded source; its menu narrows results to one drive. Normal results are ordered by catalog source, then full ID. Largest files combines known sizes across drives, descending, with source and ID as tie breakers. Counts include every matching source, while only the requested rows are hydrated. Failed sources and skipped entries appear in a persistent partial-coverage banner; **Review coverage** opens per-location details. Cancellation leaves completed private snapshots on disk but does not publish an unfinished catalog.
+
+This flow covers assigned local fixed/removable drive letters. Network/optical drives, volumes mounted only as folders, unmounted or locked volumes, and reparse targets are excluded. It does not guarantee access to every protected file. Add a reachable folder separately where appropriate. Existing snapshots are point-in-time observations; reconnecting or rescanning is explicit.
+
+## Application identity
+
+The executable embeds a seven-size Windows icon (16–256 pixels), English product metadata, and version **0.0.1**. The SVG source is used in the sidebar; generic file-type symbols distinguish source code, documents, images, media, and archives without loading Shell extensions for every result. The icon is bundled into the executable, so it does not depend on a neighboring image file.
+
+To regenerate the ICO from the deterministic vector geometry:
+
+```powershell
+New-Item -ItemType Directory -Path .temp_files -Force
+rustc scripts/generate-icon.rs -O -o .temp_files\generate-icon.exe
+.\.temp_files\generate-icon.exe
+```
 
 ## Search and file actions
 
@@ -47,8 +73,8 @@ Double-click or use **Open file/folder** to open the selected item. **Show in Ex
 
 ## Resource behavior and limits
 
-One background thread owns the source and borrowing search index. The UI receives immutable statistics and bounded result rows, without copying millions of records. One replaceable pending request coalesces rapid input, stale generations are ignored, and one pending reply bounds the return queue. Paths are reconstructed on the worker. The worker sleeps on a condition variable when idle; UI updates are event-driven.
+One background thread owns each loaded source and borrowing search index once. During a computer scan, it drops each drive's scan data before scanning the next; it then loads the published sources and search tables together. RAM scales with the sum of loaded indexes. Query merging retains at most twice the requested ID limit before truncation, and at most 10,000 hydrated rows. The UI receives immutable statistics and bounded rows, without copying millions of records. One replaceable pending request coalesces rapid input, stale generations are ignored, and one pending reply bounds the return queue. Paths are reconstructed on the worker. The worker sleeps on a condition variable when idle; UI updates are event-driven.
 
-The footer's query time measures query execution only. It excludes path hydration, delivery, painting, and source/cache loading. **Index memory** reports allocated source and search-table storage, not total process private memory or GPU memory. The overview shows size coverage among indexed files, snapshot generation, pending refresh count, and source/cache preparation times. Folder traversal can skip inaccessible entries; inspect the CLI metadata report when assessing full coverage.
+The footer's query time measures query execution and merging only. It excludes path hydration, delivery, painting, and source/cache loading. **Index memory** reports allocated source and search-table storage, not total process private memory or GPU memory. The overview shows size coverage among indexed files, per-location generations and skips, pending refresh count, failed drives, and source/cache preparation times.
 
 This is a desktop alpha. Folder totals, treemaps, allocated/reclaimable space, path/date/content search, a query parser, tray/global activation, continuous refresh, installers, and updates are not implemented. Screen-reader support, mixed-DPI/multi-monitor behavior, and long-duration UI resource budgets still need acceptance testing. See [verification results](DESKTOP_RESULTS.md).

@@ -1,4 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+mod assets;
 mod theme;
 mod view;
 use gpui::{
@@ -24,7 +25,7 @@ fn main() {
         }
     }
     Application::new()
-        .with_assets(gpui_component_assets::Assets)
+        .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             theme::configure(settings.dark, None, cx);

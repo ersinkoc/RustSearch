@@ -7,3 +7,5 @@
 *.rsidx.search
 *.rsidx.search.lock
 *.rsidx.search.tmp-*
+*.rscatalog
+*.rscatalog.tmp-*

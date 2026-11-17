@@ -13,7 +13,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::{
     Foundation::*,
     Storage::FileSystem::*,
-    System::{IO::DeviceIoControl, Ioctl::*, ProcessStatus::*, Threading::*},
+    System::{
+        IO::DeviceIoControl,
+        Ioctl::*,
+        ProcessStatus::*,
+        Threading::*,
+        WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE},
+    },
 };
 
 struct Handle(HANDLE);
@@ -75,6 +81,72 @@ pub struct VolumeInfo {
     pub volume_id: String,
     pub filesystem: String,
     pub root_id: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalDrive {
+    pub root: String,
+    pub label: String,
+    pub filesystem: String,
+    pub removable: bool,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub error: Option<String>,
+}
+
+/// Enumerate assigned local fixed/removable drive letters without opening volume data.
+/// Network/optical drives and unmounted volumes are deliberately outside this list.
+pub fn local_drives() -> Result<Vec<LocalDrive>> {
+    let mask = unsafe { GetLogicalDrives() };
+    ensure!(
+        mask != 0,
+        "list local drives: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut drives = Vec::new();
+    for letter in b'A'..=b'Z' {
+        if mask & (1 << (letter - b'A')) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", letter as char);
+        let name = wide(&root);
+        let kind = unsafe { GetDriveTypeW(name.as_ptr()) };
+        if !matches!(kind, DRIVE_FIXED | DRIVE_REMOVABLE) {
+            continue;
+        }
+        let mut label = [0u16; 261];
+        let mut filesystem = [0u16; 64];
+        let mut total = 0;
+        let mut free = 0;
+        // SAFETY: terminated root and writable buffers have the declared sizes.
+        let ready = unsafe {
+            GetVolumeInformationW(
+                name.as_ptr(),
+                label.as_mut_ptr(),
+                label.len() as u32,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            ) != 0
+                && GetDiskFreeSpaceExW(name.as_ptr(), null_mut(), &mut total, &mut free) != 0
+        };
+        let error = (!ready).then(|| std::io::Error::last_os_error().to_string());
+        let text = |v: &[u16]| {
+            String::from_utf16_lossy(&v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())])
+        };
+        drives.push(LocalDrive {
+            root,
+            label: text(&label),
+            filesystem: text(&filesystem),
+            removable: kind == DRIVE_REMOVABLE,
+            total_bytes: total,
+            free_bytes: free,
+            error,
+        });
+    }
+    Ok(drives)
 }
 
 pub fn volume_info(path: &Path) -> Result<VolumeInfo> {
@@ -575,6 +647,16 @@ fn replay(volume: &Handle, index: &Index, sizes: bool, stats: &mut ScanStats) ->
 }
 
 pub fn scan_ntfs(volume: &str, size_limit: Option<usize>) -> Result<(Index, ScanStats)> {
+    scan_ntfs_controlled(volume, size_limit, |_| true)
+}
+
+/// Cancellable native enumeration, with cancellation checks between IOCTL batches and sizes.
+pub fn scan_ntfs_controlled(
+    volume: &str,
+    size_limit: Option<usize>,
+    mut keep_going: impl FnMut(u64) -> bool,
+) -> Result<(Index, ScanStats)> {
+    ensure!(keep_going(0), "Native indexing cancelled");
     let (info, first) = probe(volume)?;
     let handle = open_volume(volume)?;
     let mut meta = metadata(&info, "ntfs-usn", info.mount.clone(), info.root_id);
@@ -593,6 +675,10 @@ pub fn scan_ntfs(volume: &str, size_limit: Option<usize>) -> Result<(Index, Scan
     let mut buffer = AlignedBuffer::new(1024 * 1024);
     let mut last = Instant::now();
     loop {
+        ensure!(
+            keep_going(index.entries.len() as u64),
+            "Native indexing cancelled"
+        );
         let n = match ioctl(&handle, FSCTL_ENUM_USN_DATA, &input, &mut buffer) {
             Ok(n) => n,
             Err(error)
@@ -634,6 +720,10 @@ pub fn scan_ntfs(volume: &str, size_limit: Option<usize>) -> Result<(Index, Scan
     if let Some(limit) = size_limit {
         let start = Instant::now();
         for row in 0..index.entries.len() {
+            ensure!(
+                keep_going(index.entries.len() as u64),
+                "Native indexing cancelled"
+            );
             let entry = index.entries[row];
             if stats.size_attempts >= limit as u64 {
                 break;
@@ -651,6 +741,10 @@ pub fn scan_ntfs(volume: &str, size_limit: Option<usize>) -> Result<(Index, Scan
         }
         stats.size_collection_ms = start.elapsed().as_secs_f64() * 1000.;
     }
+    ensure!(
+        keep_going(index.entries.len() as u64),
+        "Native indexing cancelled"
+    );
     let changes = replay(&handle, &index, size_limit == Some(usize::MAX), &mut stats)?;
     index.apply_delta(changes)?;
     index.consolidate()?;
@@ -728,6 +822,11 @@ pub fn process_sample() -> Result<ProcessSample> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_cancellation_precedes_any_volume_access() {
+        let error = super::scan_ntfs_controlled("not-a-volume", None, |_| false).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
     #[test]
     fn controlled_walk_can_cancel_without_modifying_source_files() {
         let dir = tempfile::tempdir().unwrap();
