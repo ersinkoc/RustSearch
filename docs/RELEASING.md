@@ -15,7 +15,7 @@ cargo build --workspace --release --bins --examples --locked
 
 Run the GUI with isolated data and fixture source directories that are **outside** the data directory. Verify native window controls, search, background updates after close, pause/resume, and reconnect. Record exact acceptance and known limits in `docs/DESKTOP_RESULTS.md`. Confirm the GUI file/product version and English resource metadata.
 
-Review and commit the final source and documentation. Packaging requires a clean working tree so `build-info.json` identifies a reviewable source commit. The packaging script requires Python 3.11+ and network access to retrieve omitted upstream license texts from pinned Cargo source revisions; no fetched code is executed. If a historical revision has no standalone license file, a current upstream notice is included and explicitly labeled as a fallback. Cargo's conservative notice inventory includes build and test dependencies as well as runtime dependencies.
+Review and commit the final source and documentation. Packaging requires a clean working tree so `build-info.json` identifies a reviewable source commit. The packaging script requires Python 3.11+, an authenticated GitHub CLI, and network access to retrieve omitted upstream license texts from pinned Cargo source revisions; no fetched code is executed. If a historical revision has no standalone license file, or an old crate has no VCS revision metadata, a current upstream notice is included and explicitly labeled as a fallback. Cargo's conservative notice inventory includes build and test dependencies as well as runtime dependencies.
 
 ```powershell
 python scripts/package-release.py --output .temp_files/release-0.0.1/package

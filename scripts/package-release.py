@@ -26,8 +26,17 @@ def command(*args):
     return subprocess.check_output(args, cwd=ROOT, text=True, encoding="utf-8").strip()
 
 
+@functools.lru_cache(maxsize=1)
+def github_token():
+    # Reuse gh's existing authentication without printing or persisting a token.
+    return subprocess.check_output(["gh", "auth", "token"], text=True, encoding="utf-8", stderr=subprocess.PIPE).strip()
+
+
 def fetch(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "RustSearch-release", "Accept": "application/vnd.github+json"})
+    headers = {"User-Agent": "RustSearch-release", "Accept": "application/vnd.github+json"}
+    if urllib.parse.urlparse(url).hostname == "api.github.com":
+        headers["Authorization"] = "Bearer " + github_token()
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
 
@@ -38,10 +47,14 @@ def upstream_license(repository, revision):
     parts = parsed.path.strip("/").removesuffix(".git").split("/")
     if parsed.hostname == "github.com" and len(parts) >= 2:
         repository = "/".join(parts[:2])
-        url = f"https://api.github.com/repos/{repository}/license?ref={urllib.parse.quote(revision)}"
+        url = f"https://api.github.com/repos/{repository}/license"
+        if revision:
+            url += f"?ref={urllib.parse.quote(revision)}"
         try:
             result = json.loads(fetch(url))
             source = result["html_url"]
+            if not revision:
+                source += " (current upstream notice; published crate has no VCS revision metadata)"
         except urllib.error.HTTPError as error:
             if error.code != 404:
                 raise
@@ -102,8 +115,9 @@ def main():
             shutil.copy2(file, target)
         source_url = package["repository"] or package["homepage"] or f"https://crates.io/crates/{package['name']}/{package['version']}"
         if not files and package["license"] != "CC0-1.0":
-            vcs = json.loads((directory / ".cargo_vcs_info.json").read_text())
-            content, source_url = upstream_license(source_url, vcs["git"]["sha1"])
+            vcs_file = directory / ".cargo_vcs_info.json"
+            vcs = json.loads(vcs_file.read_text()) if vcs_file.exists() else {}
+            content, source_url = upstream_license(source_url, vcs.get("git", {}).get("sha1"))
             (destination / "LICENSE-upstream.txt").write_bytes(content)
         return {"name": package["name"], "version": package["version"], "license": package["license"], "authors": package["authors"], "source": source_url}
 
