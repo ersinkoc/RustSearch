@@ -194,6 +194,23 @@ mod tests {
                     "moved.txt",
                 ] {
                     let name: Vec<_> = name.encode_utf16().collect();
+                    let overlay: Vec<_> = index
+                        .updates
+                        .values()
+                        .filter_map(Option::as_ref)
+                        .filter(|e| e.parent == parent)
+                        .collect();
+                    assert_eq!(
+                        search.child(parent, &name).map(|e| e.id),
+                        search
+                            .child_in_ranges_and_overlay(
+                                parent,
+                                &name,
+                                rows.iter().copied(),
+                                &overlay
+                            )
+                            .map(|e| e.id)
+                    );
                     assert_eq!(
                         search.child(parent, &name).map(|e| e.id),
                         search

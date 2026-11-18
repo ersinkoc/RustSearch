@@ -142,6 +142,16 @@ impl<'a> SearchIndex<'a> {
         name: &[u16],
         ranges: impl Clone + IntoIterator<Item = (u32, u32)>,
     ) -> Option<&'a Entry> {
+        self.child_in_ranges_and_overlay(parent, name, ranges, &self.overlay)
+    }
+    /// Candidate overlay rows must belong to this index; parent/key filtering remains checked.
+    pub fn child_in_ranges_and_overlay(
+        &self,
+        parent: u64,
+        name: &[u16],
+        ranges: impl Clone + IntoIterator<Item = (u32, u32)>,
+        overlay: &[&'a Entry],
+    ) -> Option<&'a Entry> {
         let key = rustsearch_core::search_key(name);
         let start = self
             .groups
@@ -172,7 +182,7 @@ impl<'a> SearchIndex<'a> {
                 }
             }
         }
-        for &entry in &self.overlay {
+        for &entry in overlay {
             if entry.parent == parent && self.index.key(entry) == key.as_slice() {
                 if self.index.name(entry) == name {
                     return Some(entry);

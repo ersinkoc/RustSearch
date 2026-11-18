@@ -363,6 +363,7 @@ struct Edit<'a> {
     children: HashMap<u64, HashMap<Vec<u16>, u64>>,
     removed: HashSet<u64>,
     parent_runs: Option<Vec<ParentRun>>,
+    overlay_by_parent: Vec<&'a rustsearch_core::Entry>,
 }
 struct ParentRun {
     parent: u64,
@@ -530,6 +531,16 @@ fn parent_runs(index: &Index) -> Option<Vec<ParentRun>> {
     runs.sort_unstable_by_key(|run| (run.parent, run.first));
     Some(runs)
 }
+fn overlay_by_parent(index: &Index) -> Vec<&rustsearch_core::Entry> {
+    let mut rows: Vec<_> = index.updates.values().filter_map(Option::as_ref).collect();
+    rows.sort_unstable_by(|a, b| {
+        a.parent
+            .cmp(&b.parent)
+            .then(index.key(a).cmp(index.key(b)))
+            .then(a.id.cmp(&b.id))
+    });
+    rows
+}
 impl Edit<'_> {
     fn child(&self, parent: u64, name: &[u16]) -> Option<u64> {
         if let Some(id) = self
@@ -539,21 +550,42 @@ impl Edit<'_> {
         {
             return Some(*id);
         }
+        let key = rustsearch_core::search_key(name);
+        let from = self.overlay_by_parent.partition_point(|entry| {
+            entry.parent < parent
+                || (entry.parent == parent && self.index.key(entry) < key.as_slice())
+        });
+        let to = self.overlay_by_parent.partition_point(|entry| {
+            entry.parent < parent
+                || (entry.parent == parent && self.index.key(entry) <= key.as_slice())
+        });
+        let overlay = &self.overlay_by_parent[from..to];
         let entry = if let Some(runs) = &self.parent_runs {
             let first = runs.partition_point(|run| run.parent < parent);
             let end = runs.partition_point(|run| run.parent <= parent);
             if end - first > 64 {
                 // Fragmented legacy layouts can have more runs than name candidates.
-                self.search.child(parent, name)
+                self.search.child_in_ranges_and_overlay(
+                    parent,
+                    name,
+                    std::iter::once((0, u32::MAX)),
+                    overlay,
+                )
             } else {
-                self.search.child_in_ranges(
+                self.search.child_in_ranges_and_overlay(
                     parent,
                     name,
                     runs[first..end].iter().map(|run| (run.first, run.end)),
+                    overlay,
                 )
             }
         } else {
-            self.search.child(parent, name)
+            self.search.child_in_ranges_and_overlay(
+                parent,
+                name,
+                std::iter::once((0, u32::MAX)),
+                overlay,
+            )
         };
         entry
             .filter(|e| match self.records.get(&e.id) {
@@ -704,7 +736,30 @@ impl Edit<'_> {
             }
             // Recheck directory attributes when dequeued; cached child metadata must not
             // permit following a directory that became a reparse point between batches.
-            self.upsert(&path, false, Some(id))?;
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    if id != self.index.metadata.root_id
+                        && error.kind() == std::io::ErrorKind::NotFound
+                    {
+                        self.erase(id);
+                    } else {
+                        self.pending.insert(id);
+                    }
+                    work.completed.insert(id, job.recursive);
+                    continue;
+                }
+            };
+            if id == self.index.metadata.root_id {
+                if metadata.file_attributes() & 0x10 == 0 || metadata.file_attributes() & 0x400 != 0
+                {
+                    self.pending.insert(id);
+                    continue;
+                }
+            } else {
+                let old = self.record(id).context("missing queued directory")?;
+                self.put_metadata(old.parent, old.name, &metadata, Some(id))?;
+            }
             if id != self.index.metadata.root_id
                 && self
                     .record(id)
@@ -904,8 +959,8 @@ impl Edit<'_> {
         old: Option<u64>,
     ) -> Result<u64> {
         let reparse = metadata.file_attributes() & 0x400 != 0;
-        let flags =
-            if metadata.is_dir() { DIRECTORY } else { 0 } | if reparse { REPARSE } else { 0 };
+        let directory = metadata.file_attributes() & 0x10 != 0;
+        let flags = if directory { DIRECTORY } else { 0 } | if reparse { REPARSE } else { 0 };
         let id = if let Some(id) = old {
             id
         } else {
@@ -917,7 +972,7 @@ impl Edit<'_> {
             id,
             parent,
             usn: 0,
-            size: (self.sizes && !metadata.is_dir() && !reparse).then_some(metadata.file_size()),
+            size: (self.sizes && !directory && !reparse).then_some(metadata.file_size()),
             flags,
             name,
         };
@@ -1024,6 +1079,7 @@ fn changes_inner(
         children: HashMap::new(),
         removed: HashSet::new(),
         parent_runs: work.as_mut().and_then(|(work, _)| work.parent_runs.take()),
+        overlay_by_parent: overlay_by_parent(index),
     };
     if edit.parent_runs.is_none()
         && (work.as_ref().is_some_and(|(work, _)| !work.is_empty())
@@ -1349,6 +1405,7 @@ mod tests {
             children: HashMap::new(),
             removed: HashSet::new(),
             parent_runs: None,
+            overlay_by_parent: overlay_by_parent(&index),
         };
         let file = root.join("temporary.txt");
         std::fs::write(&file, b"temporary").unwrap();
@@ -1408,6 +1465,7 @@ mod tests {
             children: HashMap::new(),
             removed: HashSet::new(),
             parent_runs: None,
+            overlay_by_parent: overlay_by_parent(&index),
         };
         let old = dir.path().join("old.txt");
         let new = dir.path().join("new.txt");
@@ -1428,6 +1486,53 @@ mod tests {
         rustsearch_storage::append_delta(&guard, index, &change).unwrap();
         index.apply_delta(change).unwrap();
     }
+    #[test]
+    fn directory_reparse_metadata_keeps_the_snapshot_directory_classification() {
+        use std::os::windows::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let link = source.join("junction");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let (mut index, _) = rustsearch_windows::walk(&source, false).unwrap();
+        let search = SearchIndex::build(&index);
+        let id = search
+            .child(
+                index.metadata.root_id,
+                &"junction".encode_utf16().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .id;
+        assert_eq!(
+            index.flags(index.get(id).unwrap()) & (DIRECTORY | REPARSE),
+            DIRECTORY | REPARSE
+        );
+        let delta = delta(
+            &index,
+            &search,
+            &[event(EventKind::Modify(ModifyKind::Any), vec![link])],
+            false,
+            &dir.path().join("excluded"),
+        )
+        .unwrap();
+        drop(search);
+        index.apply_delta(delta).unwrap();
+        assert_eq!(
+            index.flags(index.get(id).unwrap()) & (DIRECTORY | REPARSE),
+            DIRECTORY | REPARSE,
+            "metadata refresh must not turn a directory junction into a file"
+        );
+    }
+
     #[test]
     fn unavailable_root_keeps_saved_rows_and_marks_pending_coverage() {
         let dir = tempfile::tempdir().unwrap();
