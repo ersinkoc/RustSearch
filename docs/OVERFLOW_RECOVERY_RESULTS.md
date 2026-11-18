@@ -81,3 +81,5 @@ The previous released worker never established a stable full-drive idle interval
 ## Publication and remaining limits
 
 The source fix and English documentation are on `main`; the existing v0.0.1 tag and release ZIP retain their original bytes. The new local worker was exercised directly through its authenticated protocol; GUI layout/interaction, sign-in/reboot startup, and long-duration resource behavior were not revalidated in this backend change. Existing protected-file, reparse, native-volume-access, and upstream dependency limitations still apply.
+
+The [portable runtime follow-up](RUNTIME_INSTALLATION_RESULTS.md) records later installed-binary, saved-catalog startup, metadata-ordering, and recovery changes. The measurements above describe this earlier run.

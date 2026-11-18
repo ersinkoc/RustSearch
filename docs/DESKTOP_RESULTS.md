@@ -108,6 +108,8 @@ The subsequent [full-drive acceptance report](FULL_DRIVE_ACCEPTANCE.md) found re
 
 The subsequent [overflow recovery report](OVERFLOW_RECOVERY_RESULTS.md) records the bounded folder-recovery implementation, fair live-update scheduling under frequent queries, and successful C:/D:/E: mutation checks on approximately 21.93 million records. This source/local-build fix remains version 0.0.1; the existing public release archive predates it.
 
+The [runtime installation follow-up](RUNTIME_INSTALLATION_RESULTS.md) found the old portable executable running alongside the updated worker. It records consolidation to the updated portable installation and an additional metadata/rename ordering fix; updating source alone had not updated the downloaded application.
+
 ## Open upstream dependency alert
 
 GitHub reports [GHSA-38c5-483c-4qqp](https://github.com/becheran/grid/security/advisories/GHSA-38c5-483c-4qqp), a moderate integer-overflow advisory in `grid::Grid::expand_rows`. The desktop dependency chain is GPUI 0.2.2 → pinned Taffy 0.9.0 → grid 0.18.0. The advisory's patched version is grid 1.0.1, outside Taffy's current requirement; replacing it is not a compatible lockfile-only update. No `expand_rows` call was found in the installed Taffy 0.9.0 source, but the dependency alert remains open. This source inspection is not a full security audit. The CLI's default dependency graph does not include this GUI layout stack.

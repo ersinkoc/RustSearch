@@ -10,6 +10,8 @@ The first release scope is file/folder search plus disk-space analysis. Content 
 
 The [0.0.1 Windows x64 portable alpha](https://github.com/ersinkoc/RustSearch/releases/tag/v0.0.1) includes the GUI and CLI. Extract the ZIP and open `rustsearch-desktop.exe`. The build is unsigned; see the [portable guide](docs/PORTABLE.md) for runtime requirements, background/startup settings, and limitations. SHA-256 checksums and third-party license notices accompany the binaries.
 
+The existing release archive predates the current notification/startup fixes. Current source builds and the locally repaired installation include them; downloading the original ZIP again restores the older executable. See the [runtime results](docs/RUNTIME_INSTALLATION_RESULTS.md).
+
 ## Current capabilities
 
 - Native NTFS metadata enumeration on an explicitly selected local volume.
@@ -29,6 +31,8 @@ The [0.0.1 Windows x64 portable alpha](https://github.com/ersinkoc/RustSearch/re
 Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates CLI-native snapshots; the desktop has a separate per-user background worker for managed sources. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
 
 The published v0.0.1 archive predates the notification-overflow fix. The subsequent source build keeps its loaded index during queue recovery and has passed C:/D:/E: live-update checks on approximately 21.93 million records. See the [recovery and resource results](docs/OVERFLOW_RECOVERY_RESULTS.md) and the [original failure report](docs/FULL_DRIVE_ACCEPTANCE.md). The existing release ZIP has not been replaced.
+
+If repeated scans persist, verify the executable actually running: a source build and an extracted portable release can own separate workers. The [runtime installation follow-up](docs/RUNTIME_INSTALLATION_RESULTS.md) records that mismatch, its local repair, and a further metadata/rename ordering fix.
 
 ## Build and try
 
@@ -60,7 +64,7 @@ A normal launch starts automatic accessible-drive indexing. Use **Settings** for
 
 ## Performance evidence
 
-The retained real-disk corpus has 12.29 million records. Each report separates correctness, startup, warm query time, and memory. These are measurements of this prototype, not evidence that it beats Everything.
+The retained CLI benchmark corpus has 12.29 million records; the later [three-drive runtime checks](docs/RUNTIME_INSTALLATION_RESULTS.md) cover more than 22 million records. Each report separates correctness, startup, warm query time, and memory. These are measurements of this prototype, not evidence that it beats Everything.
 
 The latest comparison reduced cached-search private memory from about 1,086 MB to 887 MB (18.3%), with working set also falling. Median CLI startup stayed close at 1.15 versus 1.13 seconds. Query-specific results and construction costs are included in the memory report.
 
