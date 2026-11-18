@@ -625,6 +625,47 @@ impl Edit<'_> {
         if self.removed.is_empty() {
             return;
         }
+        if self.parent_runs.is_none() {
+            self.parent_runs = parent_runs(self.index);
+        }
+        if self.parent_runs.is_none() {
+            self.finish_removals_full();
+            return;
+        }
+        let mut parents: Vec<_> = std::mem::take(&mut self.removed).into_iter().collect();
+        while let Some(parent) = parents.pop() {
+            let runs = self.parent_runs.as_ref().unwrap();
+            let from = runs.partition_point(|run| run.parent < parent);
+            let to = runs.partition_point(|run| run.parent <= parent);
+            let mut candidates = Vec::new();
+            for run in &runs[from..to] {
+                candidates.extend(
+                    self.index.entries[run.first as usize..run.end as usize]
+                        .iter()
+                        .filter(|e| !self.index.updates.contains_key(&e.id))
+                        .map(|e| e.id),
+                );
+            }
+            candidates.extend(self.search.overlay_children(parent).iter().map(|e| e.id));
+            if let Some(children) = self.children.get(&parent) {
+                candidates.extend(children.values().copied());
+            }
+            for id in candidates {
+                // A staged rename may have moved a base child out of this subtree.
+                if let Some(record) = self.record(id)
+                    && record.parent == parent
+                {
+                    let directory = record.flags & DIRECTORY != 0;
+                    self.erase(id);
+                    if directory {
+                        parents.push(id);
+                    }
+                }
+            }
+            self.removed.clear();
+        }
+    }
+    fn finish_removals_full(&mut self) {
         let mut removed = std::mem::take(&mut self.removed);
         loop {
             let mut children = Vec::new();
@@ -1181,6 +1222,65 @@ fn changes_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subtree_removal_preserves_moved_out_rows_and_prunes_moved_in_and_staged_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        std::fs::create_dir_all(root.join("removed/deep")).unwrap();
+        std::fs::create_dir(root.join("kept")).unwrap();
+        for file in [
+            "removed/deep/old.txt",
+            "removed/moved-out.txt",
+            "kept/moved-in.txt",
+        ] {
+            std::fs::write(root.join(file), b"fixture").unwrap();
+        }
+        let (index, _) = rustsearch_windows::walk(&root, false).unwrap();
+        let search = SearchIndex::build(&index);
+        let mut edit = Edit {
+            index: &index,
+            search: &search,
+            records: BTreeMap::new(),
+            pending: HashSet::new(),
+            next: index.entries.last().unwrap().id + 1,
+            sizes: false,
+            children: HashMap::new(),
+            removed: HashSet::new(),
+            parent_runs: None,
+        };
+        let removed = edit.resolve(&root.join("removed")).unwrap();
+        let kept = edit.resolve(&root.join("kept")).unwrap();
+        let old = edit.resolve(&root.join("removed/deep/old.txt")).unwrap();
+        let outgoing = edit.resolve(&root.join("removed/moved-out.txt")).unwrap();
+        let incoming = edit.resolve(&root.join("kept/moved-in.txt")).unwrap();
+        std::fs::rename(
+            root.join("removed/moved-out.txt"),
+            root.join("kept/moved-out.txt"),
+        )
+        .unwrap();
+        edit.upsert(&root.join("kept/moved-out.txt"), false, Some(outgoing))
+            .unwrap();
+        std::fs::rename(
+            root.join("kept/moved-in.txt"),
+            root.join("removed/moved-in.txt"),
+        )
+        .unwrap();
+        edit.upsert(&root.join("removed/moved-in.txt"), false, Some(incoming))
+            .unwrap();
+        std::fs::create_dir(root.join("removed/staged")).unwrap();
+        std::fs::write(root.join("removed/staged/new.txt"), b"new").unwrap();
+        edit.upsert(&root.join("removed/staged"), true, None)
+            .unwrap();
+        let staged = edit.resolve(&root.join("removed/staged/new.txt")).unwrap();
+        edit.erase(removed);
+        edit.finish_removals();
+        for id in [removed, old, incoming, staged] {
+            assert!(edit.records.get(&id).is_some_and(Option::is_none));
+        }
+        assert_eq!(edit.record(outgoing).unwrap().parent, kept);
+        assert!(edit.record(kept).is_some());
+    }
+
     fn event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
         let mut event = Event::new(kind);
         event.paths = paths;
