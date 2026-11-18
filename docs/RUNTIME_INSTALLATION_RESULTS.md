@@ -26,13 +26,27 @@ An actual NTFS junction exposed another classification defect: metadata refresh 
 
 During the first cooperative recovery runs, the native reader still reported repeated buffer losses (the last pre-buffer run reached **11 backend losses / 11 queue recoveries**). Local fixed/removable/RAM volumes now use two 1 MiB buffers per reader, while remote/unclassified volumes retain two 64 KiB buffers. The reader is armed before its constructor returns. Timestamp-only filters were removed because timestamps/content are not indexed; name, size, attribute, and security notifications remain. Microsoft's [ReadDirectoryChangesW documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw) describes the network buffer limit and loss semantics. A real Windows watcher test checks immediate flushed size changes and paired renames after construction.
 
+## Durable-log follow-up
+
+The extended real-drive check exposed another independent source of repeated rebuilding: every append reparsed the complete durable log under a newly acquired writer lock. The D: log reached **66,982,890 bytes**, only **125,974 bytes below its 64 MiB limit**, before the old worker was stopped. At that limit the engine's existing recovery path would request a fresh scan even without notification loss.
+
+Managed sources now retain one writer guard across updates. The guard caches only validated sequence/checkpoint/position and file metadata, not the log contents. A new guard or changed log metadata forces full validation; stale writers, checksums, checkpoint chains, and incomplete-tail recovery remain checked. Other cooperating writers are excluded while the worker owns that source; readers remain supported.
+
+Accumulated history is atomically folded into a complete overlay checkpoint after 32 MiB of history or before an append exhausts the log budget. IDs, tombstones, UTF-16 names, unknown sizes, metadata, sequence numbers, and original base/cache bytes are retained. Checkpoint writes use a private temporary file, sync, and atomic replacement. The compacted log records its starting sequence in an `RSDEL002` header; readers also accept existing `RSDEL001` logs. The first checkpoint must be committed before it can replay, and interrupted later appends retain that checkpoint. An overlay whose checkpoint itself exceeds the 64 MiB budget still requires a new base; this is not an unlimited log format.
+
+**Checkpointed logs require the updated GUI and CLI. The original release executables cannot read this header.** Pre-checkpoint logs and binaries were backed up before updating the local installation. The public ZIP was not replaced.
+
+A private copy of the same D: snapshot/log measured **170–179 ms per empty append before**. The updated path paid **446 ms once** to validate/checkpoint, then **5.69–14.96 ms per append** (median **6.72 ms**), including durable flush. Log size fell from **56.1 MB to 18.6 MB**. Reloading that source fell from **33,334 ms to 1,003 ms**. A full canonical digest of all **240,096 overlay rows** plus metadata, counts, identity, and sequence matched after replay. These are local storage diagnostics, not an Everything comparison or whole-app startup benchmark.
+
+Recovery also retains its temporary parent-row lookup through subtree deletion before returning it to the background work queue, avoiding a second lookup-table build during the same batch.
+
 ## Checks and local build identity
 
-Version remains **0.0.1**. The installed local desktop build contains source through `4d5b58c440c7afb9172d533d11ed44696532d6d4`, with desktop SHA-256 `47158183741d93b2b61dcaf351955602e01e25f0a376a3a5558db03934bf9786`.
+Version remains **0.0.1**. The installed local desktop build contains source through `ca785e847a089e9d6d7eb7a7bd27bac5feb1bedb`, with desktop SHA-256 `a401339b8c0f971a4b743bbd8117ac788ae0f5db7dbc78d5ba42c2026b39803a`.
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --release --locked -- -D warnings`: passed.
-- `cargo test --workspace --release --locked`: **79 passed**, zero failed.
+- `cargo test --workspace --release --locked`: **83 passed**, zero failed.
 - `cargo build --workspace --bins --release --locked`: passed.
 
 These checks cover backend/runtime behavior. GUI layout, accessibility, and visual acceptance were not repeated in this change. Existing [desktop limitations](DESKTOP.md) and the upstream dependency advisory still apply.
@@ -47,19 +61,21 @@ The repaired worker reused the same saved C:/D:/E: catalog throughout the checks
 | Junction/overlay follow-up | 34,650 ms | 1,862 ms | 2.395 s |
 | Larger-buffer build | 35,767 ms | 1,530 ms | 2.781 s |
 | Reused-overlay build | 32,680 ms | 1,429 ms | 1.585 s |
-| Final subtree-range build | 31,237 ms | 1,486 ms | 1.938 s |
+| Subtree-range build | 31,237 ms | 1,486 ms | 1.938 s |
+| Checkpoint build loading accumulated legacy logs | 70,230 ms | 1,728 ms | 2.436 s |
+| Same binary after log checkpointing | 3,092 ms | Not captured at initial publication | 1.263 s |
 
-The probe interval starts after initial source publication; it is **not** process-to-first-result time. The initial publications used cache hits. These are single observations with different accumulated deltas/cache conditions, not controlled startup speedup benchmarks. The latest load remains expensive and is not represented by the earlier 2.8-second sample.
+The probe interval starts after initial source publication; it is **not** process-to-first-result time. The captured initial preparations used cache hits. On the checkpointed restart the observer joined after an update had already rebound the tables (`live`); its 216 ms preparation sample is not an initial cache-load measurement. These are single observations with different accumulated deltas/cache conditions, not controlled startup speedup benchmarks. Catalog loading excludes search preparation and client subscription. The checkpointed 3.09-second load is one warm local observation; process-to-first-result and GUI startup are not derived from it.
 
-The final publication contained **22,150,547** records; ambient changes continued during catch-up. The live harness checked all three drives while synchronization was active:
+The post-checkpoint restart publication contained **22,213,049** records; ambient changes continued during catch-up. The live harness checked all three drives while synchronization was active:
 
 | Assertion | Result |
 | --- | --- |
 | Combined/source-filtered search | 3 combined matches; 1 per drive |
-| Live creation | Visible on all drives after 0.457 s |
+| Live creation | Visible on all drives after 0.630 s |
 | File rename | Original source+ID preserved on all drives |
-| Unicode folder move | Descendant IDs retained; path predicate visible after 0.612 s |
-| Deletion | Zero fixture matches after 1.033 s |
+| Unicode folder move | Descendant IDs retained; path predicate visible after 0.654 s |
+| Deletion | Zero fixture matches after 0.674 s |
 | Persistence | All 6 snapshot/cache SHA-256 values and catalog unchanged |
 
 The resize fixture wrote 4,097 bytes on each drive; indexed sizes correctly remained unknown because this profile has size collection disabled. This run does not claim indexed size-change verification. The native watcher test and size-enabled regressions verify that path separately. Latencies are polling-harness observations during recovery, not percentile benchmarks. Owned fixture files/directories were removed.
@@ -73,3 +89,6 @@ The final subtree-range build's active catch-up sample lasted **61.44 seconds**:
 At the 18 November 2026 08:55 local checkpoint (UTC+02:00), E: had completed its saved-file traversal; C:/D: had cumulatively checked about **194,000 / 202,000 directories**, with further descendants queued. The final worker reported **zero backend losses and zero queue recoveries**. True monitoring-only CPU/RAM was not yet measured at this checkpoint. The previous worker had three application queue recoveries during local builds, coalesced into folder work without kernel loss or catalog replacement.
 
 The earlier [overflow report](OVERFLOW_RECOVERY_RESULTS.md) measured 66.82–85.33% of one core during monitoring with size collection enabled. That profile, corpus, and phase differ from this size-disabled recovery run, so no CPU/memory improvement is claimed from those numbers. Raw disk paths, endpoint credentials, row metadata, logs, hashes, and samples remain private; only aggregate evidence is published.
+
+
+The subsequent durable-log fix and real-drive checks above supersede that earlier runtime checkpoint. The post-checkpoint worker retained the same catalog and all six base/cache hashes through another C:/D:/E: live mutation run. Monitoring-only resource measurements remain pending until its offline-change check finishes.

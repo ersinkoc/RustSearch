@@ -4,6 +4,8 @@ The original public v0.0.1 ZIP predates the overflow-recovery fix in `9bb440b`. 
 
 Extract the entire ZIP to a permanent folder, then open `rustsearch-desktop.exe`. No Rust toolchain or administrator installation is needed. The desktop starts accessible-file indexing for ready local fixed drives under your Windows account. Initial scans of large drives can take substantial time; protected folders may be skipped. Use **This computer** to change scope and **Settings** to pause, stop, or configure background indexing.
 
+Current source builds can checkpoint update logs without replacing snapshots or search caches. Checkpointed logs require the updated GUI and CLI; the old released executables cannot read them. Back up saved data before switching back to an older build.
+
 The package is built for Windows x64 and tested on Windows 11. The GUI needs a working Direct3D 11 graphics driver. It imports `VCRUNTIME140.dll`; if Windows reports that DLL missing, install Microsoft's [current x64 Visual C++ v14 Redistributable](https://aka.ms/vc14/vc_redist.x64.exe). See the [official runtime requirements and downloads](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist). Runtime DLLs are not bundled.
 
 Closing the search window keeps the per-user worker running by default. Reopening reconnects to that worker. **Start with Windows** is optional and initially off; it starts only the background worker at sign-in. Settings and indexes live in `%LOCALAPPDATA%\RustSearch` unless `--data-dir PATH` is supplied. A machine-wide Windows service is not installed.
