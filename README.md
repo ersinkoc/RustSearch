@@ -80,6 +80,8 @@ Earlier 0.2/0.3/0.4 labels in historical reports identify unpublished experiment
 
 The common one-character substring follow-up reduced the `a` query from 12.04 to 6.01 ms on the same corpus, with unchanged source/search-table allocations. With two deltas it improved from 12.17 to 6.88 ms; see the common-substring report for all query groups and memory counters.
 
+The [background CPU follow-up](docs/BACKGROUND_CPU_RESULTS.md) measures bounded live-folder reconciliation on the same three-drive source.
+
 ## Project documentation
 
 - [CLI commands and limitations](docs/CLI.md)
