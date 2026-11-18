@@ -19,6 +19,8 @@ Installation adds Start menu and Installed apps entries, preserves existing sett
 
 Build 2 includes the notification/startup, saved-catalog, delta checkpoint and bounded reconciliation fixes. The original `v0.0.1` tag/archive remains available for historical reference; its executables cannot read newer checkpointed delta logs. The application version stays **0.0.1**.
 
+See the [build 2 acceptance results](docs/RELEASE_BUILD2_RESULTS.md) for clean Windows CI, public installer/download verification, saved-data preservation, and installed C:/D:/E: live-update checks.
+
 ## Current capabilities
 
 - Native NTFS metadata enumeration on an explicitly selected local volume.
