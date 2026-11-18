@@ -28,6 +28,7 @@ $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $appKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RustSearch'
 $markerName = '.rustsearch-install.json'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
+$checksumCache = @{}
 
 function FullPath([string]$Path) {
     if (-not [IO.Path]::IsPathRooted($Path) -or $Path.StartsWith('\\')) {
@@ -174,11 +175,19 @@ function Assert-BinariesUnlocked {
     }
 }
 function Verify-File([string]$Path, [string]$Manifest, [string]$Name) {
-    $matches = @(Get-Content -LiteralPath $Manifest | Where-Object {
-        $_ -match '^([a-fA-F0-9]{64})  (.+)$' -and $Matches[2] -ceq $Name
-    })
-    if ($matches.Count -ne 1) { throw "Missing or ambiguous checksum: $Name" }
-    $expected = $matches[0].Substring(0, 64)
+    if (-not $checksumCache.ContainsKey($Manifest)) {
+        $entries = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+        foreach ($line in [IO.File]::ReadAllLines($Manifest)) {
+            if (-not $line) { continue }
+            if ($line -notmatch '^([a-fA-F0-9]{64})  (.+)$') { throw 'Invalid checksum manifest.' }
+            if ($entries.ContainsKey($Matches[2])) { throw "Ambiguous checksum: $($Matches[2])" }
+            $entries.Add($Matches[2], $Matches[1])
+        }
+        $checksumCache[$Manifest] = $entries
+    }
+    $entries = $checksumCache[$Manifest]
+    if (-not $entries.ContainsKey($Name)) { throw "Missing checksum: $Name" }
+    $expected = $entries[$Name]
     $hasher = [Security.Cryptography.SHA256]::Create()
     $file = [IO.File]::OpenRead($Path)
     try { $actual = ([BitConverter]::ToString($hasher.ComputeHash($file))).Replace('-', '') }
