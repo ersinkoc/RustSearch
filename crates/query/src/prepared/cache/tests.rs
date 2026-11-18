@@ -159,6 +159,18 @@ fn persistent_cache_roundtrip_and_two_delta_generations_keep_base_cache_unchange
         "D:\\fixture\\new-folder\\moved-new.txt"
     );
     assert_eq!(std::fs::read(cache_path(&path)).unwrap(), base_cache);
+    drop(hit);
+    let base_bytes = std::fs::read(&path).unwrap();
+    let guard = WriteGuard::acquire(&path).unwrap();
+    rustsearch_storage::checkpoint_delta(&guard, &third).unwrap();
+    drop(guard);
+    let checkpointed = rustsearch_storage::load(&path).unwrap();
+    let (hit, state) = SearchIndex::prepare(&checkpointed, &path, true);
+    assert_eq!(state.state, "hit");
+    assert_eq!(state.bound_sequence, 2);
+    check(&checkpointed, &hit);
+    assert_eq!(std::fs::read(&path).unwrap(), base_bytes);
+    assert_eq!(std::fs::read(cache_path(&path)).unwrap(), base_cache);
     // An interrupted next append cannot introduce uncommitted cache-visible records.
     use std::io::Write;
     let mut log = std::fs::OpenOptions::new()

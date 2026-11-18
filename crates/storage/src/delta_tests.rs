@@ -150,3 +150,170 @@ fn failed_derived_write_preserves_published_artifact() {
     assert_eq!(std::fs::read(&path).unwrap(), b"complete");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
+
+#[test]
+fn retained_guard_validates_once_and_rejects_changed_or_stale_log_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("base.rsidx");
+    save(&path, &fixture()).unwrap();
+    let mut index = load(&path).unwrap();
+    let guard = WriteGuard::acquire(&path).unwrap();
+    let delta = transaction(&index);
+    append_delta(&guard, &index, &delta).unwrap();
+    index.apply_delta(delta).unwrap();
+    let delta = transaction(&index);
+    let stats = append_delta(&guard, &index, &delta).unwrap();
+    assert_eq!(stats.validated_log_bytes, 0);
+    index.apply_delta(delta).unwrap();
+    let stale = load(&path).unwrap();
+    let delta = transaction(&index);
+    append_delta(&guard, &index, &delta).unwrap();
+    index.apply_delta(delta).unwrap();
+    assert!(append_delta(&guard, &stale, &transaction(&stale)).is_err());
+    drop(guard);
+    let guard = WriteGuard::acquire(&path).unwrap();
+    let delta = transaction(&index);
+    let old_length = std::fs::metadata(delta_path(&path)).unwrap().len();
+    assert_eq!(
+        append_delta(&guard, &index, &delta)
+            .unwrap()
+            .validated_log_bytes,
+        old_length
+    );
+    index.apply_delta(delta).unwrap();
+    let mut bytes = std::fs::read(delta_path(&path)).unwrap();
+    bytes[50] ^= 1;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(delta_path(&path), bytes).unwrap();
+    assert!(append_delta(&guard, &index, &transaction(&index)).is_err());
+}
+
+#[test]
+fn checkpoint_preserves_sequence_tombstones_metadata_and_unknown_sizes() {
+    for native in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.rsidx");
+        let mut source = fixture();
+        if native {
+            source.metadata.checkpoint = Some(rustsearch_core::Checkpoint {
+                journal_id: 7,
+                next_usn: 10,
+            });
+        }
+        save(&path, &source).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let guard = WriteGuard::acquire(&path).unwrap();
+        let mut index = load(&path).unwrap();
+        for n in 0..5 {
+            let mut delta = transaction(&index);
+            delta.metadata.pending_refresh = vec![3];
+            delta.metadata.skipped_entries = 9;
+            delta.metadata.reparse_points_not_followed = 2;
+            if native {
+                delta.metadata.checkpoint.as_mut().unwrap().next_usn += 1;
+            }
+            delta.records.get_mut(&3).unwrap().as_mut().unwrap().size = (n != 4).then_some(n);
+            append_delta(&guard, &index, &delta).unwrap();
+            index.apply_delta(delta).unwrap();
+        }
+        let old = std::fs::read(delta_path(&path)).unwrap();
+        let sequence = index.log_sequence;
+        let stats = checkpoint_delta(&guard, &index).unwrap();
+        assert!(stats.checkpointed);
+        let log = std::fs::read(delta_path(&path)).unwrap();
+        assert_eq!(&log[..8], b"RSDEL002");
+        assert!(log.len() < old.len());
+        let mut loaded = load(&path).unwrap();
+        assert_eq!(loaded.log_sequence, sequence);
+        assert_eq!(loaded.metadata.checkpoint, index.metadata.checkpoint);
+        assert_eq!(loaded.metadata.pending_refresh, vec![3]);
+        assert_eq!(loaded.metadata.skipped_entries, 9);
+        assert_eq!(loaded.metadata.reparse_points_not_followed, 2);
+        assert!(loaded.get(2).is_none());
+        assert_eq!(
+            loaded.name(loaded.get(3).unwrap()).as_ref(),
+            "updated.txt".encode_utf16().collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.flags(loaded.get(3).unwrap()) & SIZE_KNOWN, 0);
+        let delta = transaction(&loaded);
+        assert_eq!(
+            append_delta(&guard, &loaded, &delta)
+                .unwrap()
+                .validated_log_bytes,
+            0
+        );
+        loaded.apply_delta(delta).unwrap();
+        assert_eq!(load(&path).unwrap().log_sequence, sequence + 1);
+        assert_eq!(std::fs::read(&path).unwrap(), base);
+        let before_failed_checkpoint = std::fs::read(delta_path(&path)).unwrap();
+        assert!(checkpoint_delta(&guard, &index).is_err());
+        assert_eq!(
+            std::fs::read(delta_path(&path)).unwrap(),
+            before_failed_checkpoint
+        );
+        assert!(append_delta(&guard, &index, &transaction(&index)).is_err());
+    }
+}
+
+#[test]
+fn checkpoint_requires_committed_first_frame_and_recovers_interrupted_later_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("base.rsidx");
+    save(&path, &fixture()).unwrap();
+    let guard = WriteGuard::acquire(&path).unwrap();
+    let mut index = load(&path).unwrap();
+    for _ in 0..3 {
+        let d = transaction(&index);
+        append_delta(&guard, &index, &d).unwrap();
+        index.apply_delta(d).unwrap();
+    }
+    checkpoint_delta(&guard, &index).unwrap();
+    let checkpoint = std::fs::read(delta_path(&path)).unwrap();
+    let delta = transaction(&index);
+    append_delta(&guard, &index, &delta).unwrap();
+    let complete = std::fs::read(delta_path(&path)).unwrap();
+    for cut in [8, 31, 32, 39, 40, 41, checkpoint.len() - 1] {
+        std::fs::write(delta_path(&path), &checkpoint[..cut]).unwrap();
+        assert!(load(&path).is_err(), "cut {cut}");
+    }
+    for cut in [checkpoint.len(), checkpoint.len() + 1, complete.len() - 1] {
+        std::fs::write(delta_path(&path), &complete[..cut]).unwrap();
+        let recovered = load(&path).unwrap();
+        assert_eq!(recovered.log_sequence, index.log_sequence);
+        append_delta(&guard, &recovered, &transaction(&recovered)).unwrap();
+        assert_eq!(load(&path).unwrap().log_sequence, index.log_sequence + 1);
+    }
+    for at in [32, 50, checkpoint.len() - 10] {
+        let mut corrupt = checkpoint.clone();
+        corrupt[at] ^= 1;
+        std::fs::write(delta_path(&path), corrupt).unwrap();
+        assert!(load(&path).is_err());
+    }
+}
+
+#[test]
+fn automatic_checkpoint_reclaims_history_without_resetting_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("base.rsidx");
+    save(&path, &fixture()).unwrap();
+    let guard = WriteGuard::acquire(&path).unwrap();
+    let mut index = load(&path).unwrap();
+    for _ in 0..3 {
+        let d = transaction(&index);
+        append_delta(&guard, &index, &d).unwrap();
+        index.apply_delta(d).unwrap();
+    }
+    let seq = index.log_sequence;
+    let delta = transaction(&index);
+    assert!(
+        delta::append_with_threshold(&guard, &index, &delta, 1)
+            .unwrap()
+            .checkpointed
+    );
+    index.apply_delta(delta).unwrap();
+    assert_eq!(load(&path).unwrap().log_sequence, seq + 1);
+    let delta = transaction(&index);
+    assert!(!append_delta(&guard, &index, &delta).unwrap().checkpointed);
+    index.apply_delta(delta).unwrap();
+    assert_eq!(load(&path).unwrap().log_sequence, seq + 2);
+}

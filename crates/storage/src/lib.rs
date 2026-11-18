@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 mod delta;
 mod payload;
-pub use delta::{WriteGuard, append_delta, delta_path};
+pub use delta::{WriteGuard, append_delta, checkpoint_delta, delta_path};
 pub use payload::PayloadReader;
 
 const MAGIC: &[u8; 8] = b"RSIDX001";
@@ -47,6 +47,10 @@ pub fn write_derived_atomic(
     path: &Path,
     write: impl FnOnce(&mut File) -> Result<()>,
 ) -> Result<()> {
+    write_private_atomic(path, write)
+}
+
+fn write_private_atomic(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

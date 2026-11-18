@@ -377,6 +377,7 @@ impl Engine {
                                 work
                             }).collect();
                             let mut counts:Vec<_>=loaded.indexes.iter().map(Index::counts).collect();
+                            let mut write_guards:Vec<Option<rustsearch_storage::WriteGuard>>=loaded.paths.iter().map(|_|None).collect();
                             'session: loop {
                                 let start = Instant::now();
                                 let mut prepared = Vec::new();
@@ -573,10 +574,10 @@ impl Engine {
                                     (|| -> Result<Vec<rustsearch_query::SearchTables>> {
                                         let mut retained_tables = vec![];
                                         let deltas=pending_deltas?;
-                                        for ((((index,path),table),delta),counts) in loaded.indexes.iter_mut().zip(&loaded.paths).zip(tables).zip(deltas).zip(&mut counts) {
+                                        for (((((index,path),table),delta),counts),guard) in loaded.indexes.iter_mut().zip(&loaded.paths).zip(tables).zip(deltas).zip(&mut counts).zip(&mut write_guards) {
                                             if let Some(delta)=delta {
-                                                let guard=rustsearch_storage::WriteGuard::acquire(path)?;
-                                                rustsearch_storage::append_delta(&guard,index,&delta)?;
+                                                if guard.is_none() {*guard=Some(rustsearch_storage::WriteGuard::acquire(path)?);}
+                                                rustsearch_storage::append_delta(guard.as_ref().unwrap(),index,&delta)?;
                                                 let updated_counts=delta_counts(index,&delta,*counts);
                                                 index.apply_delta(delta)?;
                                                 *counts=updated_counts;

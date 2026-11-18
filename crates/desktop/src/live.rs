@@ -1189,14 +1189,16 @@ fn changes_inner(
         }
     }
     let folders: Vec<_> = recovery.folders.into_iter().collect();
-    if let Some((work, limit)) = work {
+    if let Some((work, limit)) = work.as_mut() {
         work.folders.extend(folders);
-        edit.reconcile_chunk(work, exclude, limit, std::time::Duration::from_millis(25))?;
-        work.parent_runs = edit.parent_runs.take();
+        edit.reconcile_chunk(work, exclude, *limit, std::time::Duration::from_millis(25))?;
     } else if !folders.is_empty() {
         edit.reconcile(&folders, exclude)?;
     }
     edit.finish_removals();
+    if let Some((work, _)) = work {
+        work.parent_runs = edit.parent_runs.take();
+    }
     let mut metadata = index.metadata.clone();
     for (&id, record) in &edit.records {
         let old = index.get(id).is_some_and(|e| e.flags & REPARSE != 0);
