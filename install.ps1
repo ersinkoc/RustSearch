@@ -131,8 +131,14 @@ function Stop-ProfileWorker {
         Send-Frame $stream @{ token = $endpoint.token }
         if ((Read-Frame $stream) -ne $true) { throw 'Worker authentication failed.' }
         Send-Frame $stream 'Stop'
-        $reply = Read-Frame $stream
-        if ($reply.Runtime.running -ne $false) { throw 'Worker refused to stop.' }
+        $stopDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        do {
+            # Progress/results may already be queued ahead of the stop reply.
+            $reply = Read-Frame $stream
+            $runtimeProperty = $reply.PSObject.Properties['Runtime']
+            if ($runtimeProperty -and $runtimeProperty.Value.running -eq $false) { break }
+            if ([DateTime]::UtcNow -ge $stopDeadline) { throw 'Worker stop acknowledgement timed out.' }
+        } while ($true)
         if (-not $worker.WaitForExit(60000)) { throw 'Worker is still flushing. Retry installation after it stops.' }
         return $workerPath
     } finally { $client.Dispose(); $worker.Dispose() }

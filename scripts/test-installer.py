@@ -8,6 +8,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -183,6 +184,64 @@ class InstallerTests(unittest.TestCase):
             self.stop_worker()
         finally:
             process.wait(timeout=10)
+
+    def test_stop_drains_queued_progress_before_acknowledgement(self):
+        self.profile["background"] = True
+        self.profile_path.write_text(json.dumps(self.profile))
+        self.run_installer()
+        process = subprocess.Popen([str(self.app / "rustsearch-desktop.exe"), "--worker", "--data-dir", str(self.data)])
+        endpoint = self.data / "endpoint.json"
+        deadline = time.monotonic() + 10
+        while not endpoint.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        original = json.loads(endpoint.read_bytes())
+        failures = []
+        with socket.create_server(("127.0.0.1", 0)) as listener:
+            listener.settimeout(15)
+
+            def queued_progress_proxy():
+                try:
+                    with listener.accept()[0] as installer, socket.create_connection(("127.0.0.1", original["port"]), timeout=5) as worker:
+                        installer.settimeout(15)
+
+                        def frame(connection):
+                            def read(count):
+                                data = b""
+                                while len(data) < count:
+                                    part = connection.recv(count - len(data))
+                                    if not part:
+                                        raise EOFError()
+                                    data += part
+                                return data
+                            header = read(4)
+                            return header + read(struct.unpack("<I", header)[0])
+
+                        worker.sendall(frame(installer))
+                        installer.sendall(frame(worker))
+                        stop_request = frame(installer)
+                        self.assertEqual(json.loads(stop_request[4:]), "Stop")
+                        progress = json.dumps({"Progress": {"stage": "Monitoring changes"}}).encode()
+                        installer.sendall(struct.pack("<I", len(progress)) + progress)
+                        worker.sendall(stop_request)
+                        while True:
+                            reply = frame(worker)
+                            installer.sendall(reply)
+                            if json.loads(reply[4:]).get("Runtime", {}).get("running") is False:
+                                break
+                except Exception as error:
+                    failures.append(error)
+
+            thread = threading.Thread(target=queued_progress_proxy)
+            thread.start()
+            endpoint.write_text(json.dumps({**original, "port": listener.getsockname()[1]}))
+            try:
+                self.run_installer(archive=self.package(build=3))
+                process.wait(timeout=10)
+            finally:
+                thread.join(timeout=20)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+        self.stop_worker()
 
 
 if __name__ == "__main__":
