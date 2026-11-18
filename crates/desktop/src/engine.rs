@@ -545,7 +545,7 @@ impl Engine {
                                     if reported_recovering!=Some(recovering) || last_recovery_report.elapsed()>=std::time::Duration::from_secs(5) {
                                         let sources:Vec<_>=recoveries.iter().enumerate().map(|(source,work)| {
                                             let (checked,queued)=work.progress();
-                                            serde_json::json!({"source":source,"checked_directories":checked,"queued_directories":queued})
+                                            serde_json::json!({"source":source,"checked_directories":checked,"queued_directories":queued,"recent_parent_bytes":work.recent_parent_bytes()})
                                         }).collect();
                                         let _=rustsearch_storage::write_derived_atomic(&exclude.join("recovery-progress.json"),|file| {
                                             serde_json::to_writer_pretty(file,&serde_json::json!({"at_ms":crate::worker::now_ms(),"recovering":recovering,"sources":sources}))?;Ok(())

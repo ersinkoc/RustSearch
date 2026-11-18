@@ -363,12 +363,86 @@ struct Edit<'a> {
     children: HashMap<u64, HashMap<Vec<u16>, u64>>,
     removed: HashSet<u64>,
     parent_runs: Option<Vec<ParentRun>>,
+    recent_parents: RecentParents,
 }
 struct ParentRun {
     parent: u64,
     first: u32,
     end: u32,
 }
+// Keep common live-update parents warm without retaining a volume-wide table.
+// At most 64 parents and 4,096 row ranges: < 64 KiB including bookkeeping.
+#[derive(Default)]
+struct RecentParents {
+    parents: std::collections::VecDeque<(u64, Vec<(u32, u32)>)>,
+    max_parent: Option<u64>,
+}
+impl RecentParents {
+    fn get(&self, parent: u64) -> Option<&[(u32, u32)]> {
+        self.parents
+            .iter()
+            .find(|(id, _)| *id == parent)
+            .map(|(_, ranges)| ranges.as_slice())
+    }
+    fn ensure(&mut self, index: &Index, parent: u64) {
+        if let Some(at) = self.parents.iter().position(|(id, _)| *id == parent) {
+            let entry = self.parents.remove(at).unwrap();
+            self.parents.push_back(entry);
+            return;
+        }
+        if index.entries.len() >= u32::MAX as usize {
+            return;
+        }
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        let mut oversized = false;
+        if self.max_parent.is_none_or(|max| parent <= max) {
+            let mut max = 0;
+            for (row, entry) in index.entries.iter().enumerate() {
+                max = max.max(entry.parent);
+                if entry.parent != parent || oversized {
+                    continue;
+                }
+                let row = row as u32;
+                if let Some(last) = ranges.last_mut()
+                    && last.1 == row
+                {
+                    last.1 += 1;
+                } else if ranges.len() == 4096 {
+                    oversized = true;
+                    ranges.clear();
+                } else {
+                    ranges.push((row, row + 1));
+                }
+            }
+            self.max_parent = Some(max);
+        }
+        if oversized {
+            return;
+        }
+        ranges.shrink_to_fit();
+        while self.parents.len() >= 64
+            || self
+                .parents
+                .iter()
+                .map(|(_, r)| r.capacity())
+                .sum::<usize>()
+                + ranges.capacity()
+                > 4096
+        {
+            self.parents.pop_front();
+        }
+        self.parents.push_back((parent, ranges));
+    }
+    fn allocated_bytes(&self) -> usize {
+        self.parents.capacity() * std::mem::size_of::<(u64, Vec<(u32, u32)>)>()
+            + self
+                .parents
+                .iter()
+                .map(|(_, r)| r.capacity() * 8)
+                .sum::<usize>()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Job {
     recursive: bool,
@@ -384,6 +458,7 @@ pub struct Recovery {
     parent_runs: Option<Vec<ParentRun>>,
     base: Option<(Option<[u8; 24]>, usize, usize)>,
     checked_directories: u64,
+    recent_parents: RecentParents,
 }
 impl Recovery {
     pub fn schedule(&mut self, path: PathBuf, recursive: bool) {
@@ -398,6 +473,9 @@ impl Recovery {
             self.checked_directories,
             self.queued.len() + self.folders.len(),
         )
+    }
+    pub fn recent_parent_bytes(&self) -> usize {
+        self.recent_parents.allocated_bytes()
     }
     fn enqueue(&mut self, id: u64, job: Job, external: bool) {
         if external {
@@ -489,6 +567,7 @@ impl Recovery {
             self.parent_runs = None;
             self.base = Some(base);
             self.checked_directories = 0;
+            self.recent_parents = RecentParents::default();
         }
         let delta = changes_inner(
             index,
@@ -562,6 +641,9 @@ impl Edit<'_> {
                     runs[first..end].iter().map(|run| (run.first, run.end)),
                 )
             }
+        } else if let Some(ranges) = self.recent_parents.get(parent) {
+            self.search
+                .child_in_ranges(parent, name, ranges.iter().copied())
         } else {
             self.search
                 .child_in_ranges(parent, name, std::iter::once((0, u32::MAX)))
@@ -625,26 +707,38 @@ impl Edit<'_> {
         if self.removed.is_empty() {
             return;
         }
-        if self.parent_runs.is_none() {
-            self.parent_runs = parent_runs(self.index);
-        }
-        if self.parent_runs.is_none() {
-            self.finish_removals_full();
-            return;
-        }
         let mut parents: Vec<_> = std::mem::take(&mut self.removed).into_iter().collect();
         while let Some(parent) = parents.pop() {
-            let runs = self.parent_runs.as_ref().unwrap();
-            let from = runs.partition_point(|run| run.parent < parent);
-            let to = runs.partition_point(|run| run.parent <= parent);
+            if self.parent_runs.is_none() {
+                self.recent_parents.ensure(self.index, parent);
+                // New and originally empty directories have no immutable children.
+                // Retain the volume-wide traversal for substantial base subtrees.
+                if self
+                    .recent_parents
+                    .get(parent)
+                    .is_none_or(|ranges| !ranges.is_empty())
+                {
+                    self.parent_runs = parent_runs(self.index);
+                    if self.parent_runs.is_none() {
+                        self.removed.insert(parent);
+                        self.removed.extend(parents);
+                        self.finish_removals_full();
+                        return;
+                    }
+                }
+            }
             let mut candidates = Vec::new();
-            for run in &runs[from..to] {
-                candidates.extend(
-                    self.index.entries[run.first as usize..run.end as usize]
-                        .iter()
-                        .filter(|e| !self.index.updates.contains_key(&e.id))
-                        .map(|e| e.id),
-                );
+            if let Some(runs) = &self.parent_runs {
+                let from = runs.partition_point(|run| run.parent < parent);
+                let to = runs.partition_point(|run| run.parent <= parent);
+                for run in &runs[from..to] {
+                    candidates.extend(
+                        self.index.entries[run.first as usize..run.end as usize]
+                            .iter()
+                            .filter(|e| !self.index.updates.contains_key(&e.id))
+                            .map(|e| e.id),
+                    );
+                }
             }
             candidates.extend(self.search.overlay_children(parent).iter().map(|e| e.id));
             if let Some(children) = self.children.get(&parent) {
@@ -804,6 +898,9 @@ impl Edit<'_> {
                     continue;
                 }
             };
+            if self.parent_runs.is_none() {
+                self.recent_parents.ensure(self.index, id);
+            }
             let mut complete = true;
             for item in entries {
                 let entry = match item {
@@ -894,12 +991,35 @@ impl Edit<'_> {
                 );
             }
         } else {
-            stale.extend(
-                self.index
-                    .live_entries()
-                    .filter(|e| stale_entry(e))
-                    .map(|e| e.id),
-            );
+            for parent in scanned.keys() {
+                if let Some(ranges) = self.recent_parents.get(*parent) {
+                    for &(first, end) in ranges {
+                        for e in &self.index.entries[first as usize..end as usize] {
+                            if !self.index.updates.contains_key(&e.id) && stale_entry(e) {
+                                stale.push(e.id);
+                            }
+                        }
+                    }
+                } else {
+                    // Oversized/evicted scopes remain complete. Filter the raw parent
+                    // before consulting the overlay map, rather than probing every ID.
+                    stale.extend(
+                        self.index
+                            .entries
+                            .iter()
+                            .filter(|e| e.parent == *parent)
+                            .filter(|e| !self.index.updates.contains_key(&e.id) && stale_entry(e))
+                            .map(|e| e.id),
+                    );
+                }
+                stale.extend(
+                    self.search
+                        .overlay_children(*parent)
+                        .iter()
+                        .filter(|e| stale_entry(e))
+                        .map(|e| e.id),
+                );
+            }
         }
         stale.extend(self.records.iter().filter_map(|(&id, record)| {
             record
@@ -1101,6 +1221,11 @@ fn changes_inner(
         children: HashMap::new(),
         removed: HashSet::new(),
         parent_runs: work.as_mut().and_then(|(work, _)| work.parent_runs.take()),
+        recent_parents: work
+            .as_mut()
+            .map_or_else(RecentParents::default, |(work, _)| {
+                std::mem::take(&mut work.recent_parents)
+            }),
     };
     if edit.parent_runs.is_none()
         && (work.as_ref().is_some_and(|(work, _)| !work.is_empty())
@@ -1198,6 +1323,7 @@ fn changes_inner(
     edit.finish_removals();
     if let Some((work, _)) = work {
         work.parent_runs = edit.parent_runs.take();
+        work.recent_parents = std::mem::take(&mut edit.recent_parents);
     }
     let mut metadata = index.metadata.clone();
     for (&id, record) in &edit.records {
@@ -1249,6 +1375,7 @@ mod tests {
             children: HashMap::new(),
             removed: HashSet::new(),
             parent_runs: None,
+            recent_parents: RecentParents::default(),
         };
         let removed = edit.resolve(&root.join("removed")).unwrap();
         let kept = edit.resolve(&root.join("kept")).unwrap();
@@ -1281,6 +1408,261 @@ mod tests {
         }
         assert_eq!(edit.record(outgoing).unwrap().parent, kept);
         assert!(edit.record(kept).is_some());
+    }
+
+    #[test]
+    fn bounded_parent_cache_keeps_deletions_moves_and_overlay_children_correct_after_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..80 {
+            let parent = dir.path().join(format!("folder-{i}"));
+            std::fs::create_dir(&parent).unwrap();
+            for file in ["keep.txt", "remove.txt"] {
+                std::fs::write(parent.join(file), b"owned").unwrap();
+            }
+        }
+        let (mut index, _) = rustsearch_windows::walk(dir.path(), false).unwrap();
+        let mut search = SearchIndex::build(&index);
+        let mut work = Recovery::default();
+        let exclude = dir.path().join("excluded");
+        for i in 0..80 {
+            let parent = dir.path().join(format!("folder-{i}"));
+            let d = work
+                .step(&index, &search, &[], &[(parent, false)], false, &exclude)
+                .unwrap();
+            assert!(d.records.is_empty());
+            assert!(work.is_empty());
+            assert!(work.recent_parent_bytes() < 64 * 1024);
+        }
+        let first = dir.path().join("folder-0");
+        let last = dir.path().join("folder-79");
+        std::fs::remove_file(first.join("remove.txt")).unwrap();
+        let d = work
+            .step(
+                &index,
+                &search,
+                &[],
+                &[(first.clone(), false)],
+                false,
+                &exclude,
+            )
+            .unwrap();
+        assert_eq!(d.records.values().filter(|r| r.is_none()).count(), 1);
+        let table = search.detach();
+        index.apply_delta(d).unwrap();
+        search = table.attach(&index).unwrap();
+        let old = last.join("keep.txt");
+        let new = first.join("moved.txt");
+        let parent = index
+            .live_entries()
+            .find(|e| index.name(e).as_ref() == "folder-79".encode_utf16().collect::<Vec<_>>())
+            .unwrap()
+            .id;
+        let id = search
+            .child(parent, &"keep.txt".encode_utf16().collect::<Vec<_>>())
+            .unwrap()
+            .id;
+        std::fs::rename(&old, &new).unwrap();
+        let d = work
+            .step(
+                &index,
+                &search,
+                &[event(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                    vec![old, new.clone()],
+                )],
+                &[],
+                false,
+                &exclude,
+            )
+            .unwrap();
+        let table = search.detach();
+        index.apply_delta(d).unwrap();
+        search = table.attach(&index).unwrap();
+        assert_eq!(
+            index.path_utf16(index.get(id).unwrap()).unwrap(),
+            std::fs::canonicalize(&new)
+                .unwrap()
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>()
+        );
+        let overlay = first.join("overlay-only.txt");
+        std::fs::write(&overlay, b"new").unwrap();
+        let d = work
+            .step(
+                &index,
+                &search,
+                &[],
+                &[(first.clone(), false)],
+                false,
+                &exclude,
+            )
+            .unwrap();
+        let overlay_id = *d
+            .records
+            .iter()
+            .find(|(_, r)| {
+                r.as_ref().is_some_and(|r| {
+                    r.name == "overlay-only.txt".encode_utf16().collect::<Vec<_>>()
+                })
+            })
+            .unwrap()
+            .0;
+        let table = search.detach();
+        index.apply_delta(d).unwrap();
+        search = table.attach(&index).unwrap();
+        std::fs::remove_file(overlay).unwrap();
+        let d = work
+            .step(&index, &search, &[], &[(first, false)], false, &exclude)
+            .unwrap();
+        assert!(d.records.get(&overlay_id).is_some_and(Option::is_none));
+        assert!(index.get(id).is_some());
+        assert!(work.recent_parent_bytes() < 64 * 1024);
+    }
+
+    #[test]
+    fn deleting_new_directory_also_removes_a_base_subtree_moved_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("kept/old/deep")).unwrap();
+        std::fs::write(dir.path().join("kept/old/deep/child.txt"), b"owned").unwrap();
+        let (index, _) = rustsearch_windows::walk(dir.path(), false).unwrap();
+        let search = SearchIndex::build(&index);
+        let mut edit = Edit {
+            index: &index,
+            search: &search,
+            records: BTreeMap::new(),
+            pending: HashSet::new(),
+            next: index.entries.last().unwrap().id + 1,
+            sizes: false,
+            children: HashMap::new(),
+            removed: HashSet::new(),
+            parent_runs: None,
+            recent_parents: RecentParents::default(),
+        };
+        let old = edit.resolve(&dir.path().join("kept/old")).unwrap();
+        let child = edit
+            .resolve(&dir.path().join("kept/old/deep/child.txt"))
+            .unwrap();
+        std::fs::create_dir(dir.path().join("new")).unwrap();
+        edit.upsert(&dir.path().join("new"), false, None).unwrap();
+        let new = edit.resolve(&dir.path().join("new")).unwrap();
+        std::fs::rename(dir.path().join("kept/old"), dir.path().join("new/old")).unwrap();
+        edit.upsert(&dir.path().join("new/old"), false, Some(old))
+            .unwrap();
+        edit.erase(new);
+        edit.finish_removals();
+        for id in [new, old, child] {
+            assert!(edit.records.get(&id).is_some_and(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn fragmented_parent_over_cache_budget_is_pruned_without_losing_other_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let (mut index, _) = rustsearch_windows::walk(dir.path(), false).unwrap();
+        let target_id = index
+            .entries
+            .iter()
+            .find(|e| index.name(e).as_ref() == "target".encode_utf16().collect::<Vec<_>>())
+            .unwrap()
+            .id;
+        let other_id = index
+            .entries
+            .iter()
+            .find(|e| index.name(e).as_ref() == "other".encode_utf16().collect::<Vec<_>>())
+            .unwrap()
+            .id;
+        let first = index.entries.last().unwrap().id + 1;
+        for n in 0..10000 {
+            index
+                .push(Record {
+                    id: first + n,
+                    parent: if n % 2 == 0 { target_id } else { other_id },
+                    usn: 0,
+                    size: None,
+                    flags: 0,
+                    name: format!("virtual-{n}").encode_utf16().collect(),
+                })
+                .unwrap();
+        }
+        index.finish().unwrap();
+        let search = SearchIndex::build(&index);
+        let mut work = Recovery::default();
+        let d = work
+            .step(
+                &index,
+                &search,
+                &[],
+                &[(target, false)],
+                false,
+                &dir.path().join("excluded"),
+            )
+            .unwrap();
+        assert_eq!(d.records.len(), 5000);
+        assert!(
+            d.records
+                .iter()
+                .all(|(id, r)| (*id - first) % 2 == 0 && r.is_none())
+        );
+        assert!(work.recent_parent_bytes() < 64 * 1024);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn parent_cache_is_invalidated_when_the_base_generation_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("child.txt"), b"owned").unwrap();
+        let (old, _) = rustsearch_windows::walk(dir.path(), false).unwrap();
+        let search = SearchIndex::build(&old);
+        let mut work = Recovery::default();
+        for parent in [&a, &b] {
+            let d = work
+                .step(
+                    &old,
+                    &search,
+                    &[],
+                    &[(parent.clone(), false)],
+                    false,
+                    &dir.path().join("excluded"),
+                )
+                .unwrap();
+            assert!(d.records.is_empty());
+        }
+        std::fs::rename(a.join("child.txt"), b.join("child.txt")).unwrap();
+        let (new, _) = rustsearch_windows::walk(dir.path(), false).unwrap();
+        assert_eq!(old.entries.len(), new.entries.len());
+        let search = SearchIndex::build(&new);
+        let id = search
+            .child(
+                new.entries
+                    .iter()
+                    .find(|e| new.name(e).as_ref() == "b".encode_utf16().collect::<Vec<_>>())
+                    .unwrap()
+                    .id,
+                &"child.txt".encode_utf16().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .id;
+        std::fs::remove_file(b.join("child.txt")).unwrap();
+        let d = work
+            .step(
+                &new,
+                &search,
+                &[],
+                &[(b, false)],
+                false,
+                &dir.path().join("excluded"),
+            )
+            .unwrap();
+        assert!(d.records.get(&id).is_some_and(Option::is_none));
     }
 
     fn event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
@@ -1487,6 +1869,7 @@ mod tests {
             children: HashMap::new(),
             removed: HashSet::new(),
             parent_runs: None,
+            recent_parents: RecentParents::default(),
         };
         let file = root.join("temporary.txt");
         std::fs::write(&file, b"temporary").unwrap();
@@ -1546,6 +1929,7 @@ mod tests {
             children: HashMap::new(),
             removed: HashSet::new(),
             parent_runs: None,
+            recent_parents: RecentParents::default(),
         };
         let old = dir.path().join("old.txt");
         let new = dir.path().join("new.txt");
