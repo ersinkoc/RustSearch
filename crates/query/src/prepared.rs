@@ -142,7 +142,17 @@ impl<'a> SearchIndex<'a> {
         name: &[u16],
         ranges: impl Clone + IntoIterator<Item = (u32, u32)>,
     ) -> Option<&'a Entry> {
-        self.child_in_ranges_and_overlay(parent, name, ranges, &self.overlay)
+        let key = rustsearch_core::search_key(name);
+        let children = self.overlay_children(parent);
+        let from = children.partition_point(|entry| self.index.key(entry) < key.as_slice());
+        let to = children.partition_point(|entry| self.index.key(entry) <= key.as_slice());
+        self.child_in_ranges_and_overlay(parent, name, ranges, &children[from..to])
+    }
+    /// Current overlay children in parent/key order, borrowed without another lookup table.
+    pub fn overlay_children(&self, parent: u64) -> &[&'a Entry] {
+        let from = self.overlay.partition_point(|entry| entry.parent < parent);
+        let to = self.overlay.partition_point(|entry| entry.parent <= parent);
+        &self.overlay[from..to]
     }
     /// Candidate overlay rows must belong to this index; parent/key filtering remains checked.
     pub fn child_in_ranges_and_overlay(
@@ -332,6 +342,12 @@ impl<'a> SearchIndex<'a> {
             .values()
             .filter_map(Option::as_ref)
             .collect();
+        self.overlay.sort_unstable_by(|a, b| {
+            a.parent
+                .cmp(&b.parent)
+                .then(self.index.key(a).cmp(self.index.key(b)))
+                .then(a.id.cmp(&b.id))
+        });
         self.directories = self.base_directories;
         if self.index.updates.is_empty() {
             return;

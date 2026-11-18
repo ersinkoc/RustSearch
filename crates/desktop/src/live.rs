@@ -363,7 +363,6 @@ struct Edit<'a> {
     children: HashMap<u64, HashMap<Vec<u16>, u64>>,
     removed: HashSet<u64>,
     parent_runs: Option<Vec<ParentRun>>,
-    overlay_by_parent: Vec<&'a rustsearch_core::Entry>,
 }
 struct ParentRun {
     parent: u64,
@@ -384,6 +383,7 @@ pub struct Recovery {
     completed: HashMap<u64, bool>,
     parent_runs: Option<Vec<ParentRun>>,
     base: Option<(Option<[u8; 24]>, usize, usize)>,
+    checked_directories: u64,
 }
 impl Recovery {
     pub fn schedule(&mut self, path: PathBuf, recursive: bool) {
@@ -391,6 +391,13 @@ impl Recovery {
     }
     pub fn is_empty(&self) -> bool {
         self.folders.is_empty() && self.queued.is_empty()
+    }
+    /// Aggregate recovery diagnostics; no changed-file paths are retained.
+    pub fn progress(&self) -> (u64, usize) {
+        (
+            self.checked_directories,
+            self.queued.len() + self.folders.len(),
+        )
     }
     fn enqueue(&mut self, id: u64, job: Job, external: bool) {
         if external {
@@ -481,6 +488,7 @@ impl Recovery {
             self.completed.clear();
             self.parent_runs = None;
             self.base = Some(base);
+            self.checked_directories = 0;
         }
         let delta = changes_inner(
             index,
@@ -531,16 +539,6 @@ fn parent_runs(index: &Index) -> Option<Vec<ParentRun>> {
     runs.sort_unstable_by_key(|run| (run.parent, run.first));
     Some(runs)
 }
-fn overlay_by_parent(index: &Index) -> Vec<&rustsearch_core::Entry> {
-    let mut rows: Vec<_> = index.updates.values().filter_map(Option::as_ref).collect();
-    rows.sort_unstable_by(|a, b| {
-        a.parent
-            .cmp(&b.parent)
-            .then(index.key(a).cmp(index.key(b)))
-            .then(a.id.cmp(&b.id))
-    });
-    rows
-}
 impl Edit<'_> {
     fn child(&self, parent: u64, name: &[u16]) -> Option<u64> {
         if let Some(id) = self
@@ -550,42 +548,23 @@ impl Edit<'_> {
         {
             return Some(*id);
         }
-        let key = rustsearch_core::search_key(name);
-        let from = self.overlay_by_parent.partition_point(|entry| {
-            entry.parent < parent
-                || (entry.parent == parent && self.index.key(entry) < key.as_slice())
-        });
-        let to = self.overlay_by_parent.partition_point(|entry| {
-            entry.parent < parent
-                || (entry.parent == parent && self.index.key(entry) <= key.as_slice())
-        });
-        let overlay = &self.overlay_by_parent[from..to];
         let entry = if let Some(runs) = &self.parent_runs {
             let first = runs.partition_point(|run| run.parent < parent);
             let end = runs.partition_point(|run| run.parent <= parent);
             if end - first > 64 {
                 // Fragmented legacy layouts can have more runs than name candidates.
-                self.search.child_in_ranges_and_overlay(
-                    parent,
-                    name,
-                    std::iter::once((0, u32::MAX)),
-                    overlay,
-                )
+                self.search
+                    .child_in_ranges(parent, name, std::iter::once((0, u32::MAX)))
             } else {
-                self.search.child_in_ranges_and_overlay(
+                self.search.child_in_ranges(
                     parent,
                     name,
                     runs[first..end].iter().map(|run| (run.first, run.end)),
-                    overlay,
                 )
             }
         } else {
-            self.search.child_in_ranges_and_overlay(
-                parent,
-                name,
-                std::iter::once((0, u32::MAX)),
-                overlay,
-            )
+            self.search
+                .child_in_ranges(parent, name, std::iter::once((0, u32::MAX)))
         };
         entry
             .filter(|e| match self.records.get(&e.id) {
@@ -725,6 +704,7 @@ impl Edit<'_> {
         while visited < limit && (visited == 0 || started.elapsed() < time) {
             let Some((id, job)) = work.pop() else { break };
             visited += 1;
+            work.checked_directories = work.checked_directories.saturating_add(1);
             if id != self.index.metadata.root_id && self.record(id).is_none() {
                 continue;
             }
@@ -863,14 +843,15 @@ impl Edit<'_> {
                     }
                 }
             }
-            stale.extend(
-                self.index
-                    .updates
-                    .values()
-                    .filter_map(Option::as_ref)
-                    .filter(|e| stale_entry(e))
-                    .map(|e| e.id),
-            );
+            for parent in scanned.keys() {
+                stale.extend(
+                    self.search
+                        .overlay_children(*parent)
+                        .iter()
+                        .filter(|e| stale_entry(e))
+                        .map(|e| e.id),
+                );
+            }
         } else {
             stale.extend(
                 self.index
@@ -1079,7 +1060,6 @@ fn changes_inner(
         children: HashMap::new(),
         removed: HashSet::new(),
         parent_runs: work.as_mut().and_then(|(work, _)| work.parent_runs.take()),
-        overlay_by_parent: overlay_by_parent(index),
     };
     if edit.parent_runs.is_none()
         && (work.as_ref().is_some_and(|(work, _)| !work.is_empty())
@@ -1405,7 +1385,6 @@ mod tests {
             children: HashMap::new(),
             removed: HashSet::new(),
             parent_runs: None,
-            overlay_by_parent: overlay_by_parent(&index),
         };
         let file = root.join("temporary.txt");
         std::fs::write(&file, b"temporary").unwrap();
@@ -1465,7 +1444,6 @@ mod tests {
             children: HashMap::new(),
             removed: HashSet::new(),
             parent_runs: None,
-            overlay_by_parent: overlay_by_parent(&index),
         };
         let old = dir.path().join("old.txt");
         let new = dir.path().join("new.txt");

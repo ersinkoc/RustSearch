@@ -369,6 +369,8 @@ impl Engine {
                             let mut active_search = search;
                             let mut last_refresh = Instant::now();
                             let mut last_watch_stats=None;
+                            let mut last_recovery_report=Instant::now();
+                            let mut reported_recovering=None;
                             let mut recoveries:Vec<_>=loaded.indexes.iter().map(|index| {
                                 let mut work=crate::live::Recovery::default();
                                 if resumed && index.metadata.source!="ntfs-usn" {work.schedule(PathBuf::from(&index.metadata.root),true);}
@@ -538,6 +540,17 @@ impl Engine {
                                         Ok(changes)
                                     })();
                                     last_refresh=Instant::now();
+                                    let recovering=recoveries.iter().any(|work|!work.is_empty());
+                                    if reported_recovering!=Some(recovering) || last_recovery_report.elapsed()>=std::time::Duration::from_secs(5) {
+                                        let sources:Vec<_>=recoveries.iter().enumerate().map(|(source,work)| {
+                                            let (checked,queued)=work.progress();
+                                            serde_json::json!({"source":source,"checked_directories":checked,"queued_directories":queued})
+                                        }).collect();
+                                        let _=rustsearch_storage::write_derived_atomic(&exclude.join("recovery-progress.json"),|file| {
+                                            serde_json::to_writer_pretty(file,&serde_json::json!({"at_ms":crate::worker::now_ms(),"recovering":recovering,"sources":sources}))?;Ok(())
+                                        });
+                                        last_recovery_report=Instant::now();reported_recovering=Some(recovering);
+                                    }
                                     // Ordinary log/attribute notifications often do not change indexed
                                     // fields. Keep borrowing the same tables and statistics in that case.
                                     if changes.as_ref().is_ok_and(|items|items.iter().all(Option::is_none)) {
