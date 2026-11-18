@@ -8,9 +8,16 @@ The first release scope is file/folder search plus disk-space analysis. Content 
 
 ## Download
 
-The [0.0.1 Windows x64 portable alpha](https://github.com/ersinkoc/RustSearch/releases/tag/v0.0.1) includes the GUI and CLI. Extract the ZIP and open `rustsearch-desktop.exe`. The build is unsigned; see the [portable guide](docs/PORTABLE.md) for runtime requirements, background/startup settings, and limitations. SHA-256 checksums and third-party license notices accompany the binaries.
+The [0.0.1 Windows x64 release, build 2](https://github.com/ersinkoc/RustSearch/releases/tag/v0.0.1-build.2) includes the GUI, CLI, and a per-user PowerShell installer:
 
-The existing release archive predates the current notification/startup fixes. Current source builds and the locally repaired installation include them; downloading the original ZIP again restores the older executable. See the [runtime results](docs/RUNTIME_INSTALLATION_RESULTS.md).
+```powershell
+Invoke-WebRequest https://github.com/ersinkoc/RustSearch/releases/latest/download/install.ps1 -OutFile install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Installation adds Start menu and Installed apps entries, preserves existing settings/indexes, and redirects enabled sign-in startup to a permanent location. Optional `-StartWithWindows` and `-DesktopShortcut` switches are available. See the [installation guide](docs/INSTALL.md) for updates, offline installation, uninstall, and runtime requirements. The ZIP also runs [portably](docs/PORTABLE.md). Binaries/scripts are unsigned; SHA-256 checksums and third-party notices accompany them.
+
+Build 2 includes the notification/startup, saved-catalog, delta checkpoint and bounded reconciliation fixes. The original `v0.0.1` tag/archive remains available for historical reference; its executables cannot read newer checkpointed delta logs. The application version stays **0.0.1**.
 
 ## Current capabilities
 
@@ -30,7 +37,7 @@ The existing release archive predates the current notification/startup fixes. Cu
 
 Native indexing stores one canonical name per file reference; additional hard-link names are not enumerated. Sizes remain unknown unless collected. `refresh` updates CLI-native snapshots; the desktop has a separate per-user background worker for managed sources. Queries do not search file contents. Allocated space, alternate streams, folder totals, and treemaps are not implemented.
 
-The published v0.0.1 archive predates the notification-overflow fix. The subsequent source build keeps its loaded index during queue recovery and has passed C:/D:/E: live-update checks on approximately 21.93 million records. See the [recovery and resource results](docs/OVERFLOW_RECOVERY_RESULTS.md) and the [original failure report](docs/FULL_DRIVE_ACCEPTANCE.md). The existing release ZIP has not been replaced.
+Build 2 keeps its loaded index during queue recovery and includes the fixes verified in the C:/D:/E: follow-ups. See the [recovery and resource results](docs/OVERFLOW_RECOVERY_RESULTS.md), [runtime installation results](docs/RUNTIME_INSTALLATION_RESULTS.md), and [bounded reconciliation measurements](docs/BACKGROUND_CPU_RESULTS.md). Historical reports refer to the original archive, which has not been replaced.
 
 If repeated scans persist, verify the executable actually running: a source build and an extracted portable release can own separate workers. The [runtime installation follow-up](docs/RUNTIME_INSTALLATION_RESULTS.md) records that mismatch, its local repair, and a further metadata/rename ordering fix.
 
@@ -85,6 +92,7 @@ The [background CPU follow-up](docs/BACKGROUND_CPU_RESULTS.md) measures bounded 
 ## Project documentation
 
 - [CLI commands and limitations](docs/CLI.md)
+- [Install, update, and uninstall](docs/INSTALL.md)
 - [Desktop app and shortcuts](docs/DESKTOP.md)
 - [Desktop visual and correctness checks](docs/DESKTOP_RESULTS.md)
 - [Full-drive search and original monitoring failure](docs/FULL_DRIVE_ACCEPTANCE.md)

@@ -1,0 +1,53 @@
+name: Windows release checks
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.93.0
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt,clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --release --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --release --locked
+      - name: Build GUI and CLI
+        run: cargo build --workspace --bins --release --locked
+      - name: Installer acceptance (Windows PowerShell 5.1)
+        run: python scripts/test-installer.py
+      - name: Installer acceptance (PowerShell 7)
+        env:
+          RUSTSEARCH_TEST_POWERSHELL: pwsh.exe
+        run: python scripts/test-installer.py
+      - name: Package build 2 with provenance and notices
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/package-release.py --build 2 --output .temp_files/package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: windows-x64-package
+          path: |
+            .temp_files/package/*.zip
+            .temp_files/package/*.ps1
+            .temp_files/package/SHA256SUMS.txt
+          if-no-files-found: error

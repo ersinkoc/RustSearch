@@ -73,13 +73,16 @@ def upstream_license(repository, revision):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="New output directory; existing packages are never overwritten")
+    parser.add_argument("--build", type=int, required=True, help="Immutable distribution build; product version is unchanged")
     args = parser.parse_args()
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     if command("git", "status", "--porcelain", "--untracked-files=normal"):
         raise SystemExit("Commit the reviewed sources before packaging release provenance.")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    name = f"rustsearch-{version}-windows-x64"
+    if args.build < 2:
+        raise ValueError("Build numbers start at 2; the original release is preserved")
+    name = f"rustsearch-{version}-build.{args.build}-windows-x64"
     stage = output / name
     stage.mkdir()
     for filename in ("rustsearch.exe", "rustsearch-desktop.exe"):
@@ -94,7 +97,10 @@ def main():
     if command(str(stage / "rustsearch.exe"), "--version") != f"rustsearch {version}":
         raise ValueError("CLI version does not match the workspace")
     shutil.copy2(ROOT / "docs" / "PORTABLE.md", stage / "README.md")
-    shutil.copy2(ROOT / "docs" / "releases" / f"v{version}.md", stage / "RELEASE_NOTES.md")
+    shutil.copy2(ROOT / "docs" / "INSTALL.md", stage / "INSTALL.md")
+    for script in ("install.ps1", "uninstall.ps1"):
+        shutil.copy2(ROOT / script, stage / script)
+    shutil.copy2(ROOT / "docs" / "releases" / f"v{version}-build.{args.build}.md", stage / "RELEASE_NOTES.md")
     metadata = json.loads(command("cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", "x86_64-pc-windows-msvc"))
     external = sorted((p for p in metadata["packages"] if p["id"] not in metadata["workspace_members"]), key=lambda p: (p["name"], p["version"]))
 
@@ -145,7 +151,7 @@ def main():
         lines.extend([f"## {p['name']} {p['version']}", "", f"Declared license: {p['license']}", "", f"Source: {p['source']}", "", "Authors: " + ("; ".join(p["authors"]) or "See the upstream license/source notices."), ""])
     (stage / "THIRD_PARTY_NOTICES.md").write_text("\n".join(lines), encoding="utf-8")
     (stage / "dependency-inventory.json").write_text(json.dumps(inventory, indent=2), encoding="utf-8")
-    info = {"version": version, "commit": command("git", "rev-parse", "HEAD"), "target": "x86_64-pc-windows-msvc", "rustc": command("rustc", "--version"), "cargo_lock_sha256": hashlib.sha256((ROOT / "Cargo.lock").read_bytes()).hexdigest()}
+    info = {"version": version, "build": args.build, "release_tag": f"v{version}-build.{args.build}", "commit": command("git", "rev-parse", "HEAD"), "target": "x86_64-pc-windows-msvc", "rustc": command("rustc", "--version"), "cargo_lock_sha256": hashlib.sha256((ROOT / "Cargo.lock").read_bytes()).hexdigest()}
     (stage / "build-info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
     hashes = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(stage).as_posix()}" for p in sorted(stage.rglob("*")) if p.is_file()]
     (stage / "SHA256SUMS.txt").write_text("\n".join(hashes) + "\n", encoding="utf-8")
@@ -156,7 +162,11 @@ def main():
             if file.is_file():
                 zip_file.write(file, file.relative_to(output))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    (output / "SHA256SUMS.txt").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+    release_hashes = [f"{digest}  {archive.name}"]
+    for script in ("install.ps1", "uninstall.ps1"):
+        shutil.copy2(ROOT / script, output / script)
+        release_hashes.append(f"{hashlib.sha256((output / script).read_bytes()).hexdigest()}  {script}")
+    (output / "SHA256SUMS.txt").write_text("\n".join(release_hashes) + "\n", encoding="utf-8")
     print(json.dumps({"archive": str(archive), "sha256": digest, "commit": info["commit"], "dependency_notices": len(inventory)}, indent=2))
 
 
