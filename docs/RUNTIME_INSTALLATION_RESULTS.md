@@ -112,3 +112,5 @@ The running worker recorded **one application queue recovery and zero backend lo
 The local portable package's **987 checksum entries** were verified. One updated portable worker remains enabled for the normal data directory and Windows sign-in startup; the unused development profile remains disabled. Public **v0.0.1** tag/archive bytes are unchanged. GUI layout and visual acceptance were not rerun for this backend change.
 
 Raw disk paths, endpoint credentials, row metadata, logs, hashes, and process samples stay private. Only aggregate evidence is published here.
+
+The [bounded live-folder follow-up](BACKGROUND_CPU_RESULTS.md) records the subsequent small-scope pruning optimization, four additional controls, and fresh same-disk monitoring windows. Earlier measurements above remain historical.
