@@ -1350,9 +1350,16 @@ fn changes_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Synthetic notification paths must use the same canonical spelling as
+    // Engine's real watch roots, including when TEMP is an 8.3 alias or junction.
+    fn canonical_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
     #[test]
     fn subtree_removal_preserves_moved_out_rows_and_prunes_moved_in_and_staged_children() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let root = dir.path().join("source");
         std::fs::create_dir_all(root.join("removed/deep")).unwrap();
         std::fs::create_dir(root.join("kept")).unwrap();
@@ -1412,7 +1419,7 @@ mod tests {
 
     #[test]
     fn bounded_parent_cache_keeps_deletions_moves_and_overlay_children_correct_after_eviction() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         for i in 0..80 {
             let parent = dir.path().join(format!("folder-{i}"));
             std::fs::create_dir(&parent).unwrap();
@@ -1522,7 +1529,7 @@ mod tests {
 
     #[test]
     fn deleting_new_directory_also_removes_a_base_subtree_moved_into_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         std::fs::create_dir_all(dir.path().join("kept/old/deep")).unwrap();
         std::fs::write(dir.path().join("kept/old/deep/child.txt"), b"owned").unwrap();
         let (index, _) = rustsearch_windows::walk(dir.path(), false).unwrap();
@@ -1558,7 +1565,7 @@ mod tests {
 
     #[test]
     fn fragmented_parent_over_cache_budget_is_pruned_without_losing_other_folders() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let target = dir.path().join("target");
         let other = dir.path().join("other");
         std::fs::create_dir(&target).unwrap();
@@ -1614,7 +1621,7 @@ mod tests {
 
     #[test]
     fn parent_cache_is_invalidated_when_the_base_generation_changes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
         std::fs::create_dir(&a).unwrap();
@@ -1718,7 +1725,7 @@ mod tests {
     }
     #[test]
     fn folder_recovery_reconciles_a_structural_burst_and_real_loss_without_rewriting_base() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let root = dir.path().join("source");
         let storage = dir.path().join("data");
         std::fs::create_dir(&root).unwrap();
@@ -1854,7 +1861,7 @@ mod tests {
     }
     #[test]
     fn folder_recovery_discards_a_staged_file_that_vanished_before_enumeration() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let root = dir.path().join("source");
         std::fs::create_dir(&root).unwrap();
         let (index, _) = rustsearch_windows::walk(&root, true).unwrap();
@@ -1915,7 +1922,7 @@ mod tests {
     }
     #[test]
     fn renamed_cached_child_does_not_shadow_a_new_file_at_its_old_name() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         std::fs::write(dir.path().join("old.txt"), b"original").unwrap();
         let (index, _) = rustsearch_windows::walk(dir.path(), true).unwrap();
         let search = SearchIndex::build(&index);
@@ -1953,7 +1960,7 @@ mod tests {
     #[test]
     fn directory_reparse_metadata_keeps_the_snapshot_directory_classification() {
         use std::os::windows::process::CommandExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let source = dir.path().join("source");
         let target = dir.path().join("target");
         std::fs::create_dir(&source).unwrap();
@@ -1999,7 +2006,7 @@ mod tests {
 
     #[test]
     fn unavailable_root_keeps_saved_rows_and_marks_pending_coverage() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let root = dir.path().join("source");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("saved.txt"), b"saved").unwrap();
@@ -2032,7 +2039,7 @@ mod tests {
 
     #[test]
     fn live_directory_changes_jump_ahead_of_startup_recovery() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let root = dir.path().join("source");
         for n in 0..80 {
             std::fs::create_dir_all(root.join(format!("dir-{n}"))).unwrap();
@@ -2096,7 +2103,7 @@ mod tests {
 
     #[test]
     fn deleting_an_ancestor_during_recovery_does_not_invalidate_queued_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let root = dir.path().join("source");
         std::fs::create_dir_all(root.join("B/deep/deeper")).unwrap();
         std::fs::write(root.join("B/deep/deeper/old.txt"), b"old").unwrap();
@@ -2135,7 +2142,7 @@ mod tests {
 
     #[test]
     fn bounded_recovery_preserves_queued_directory_moves_and_finishes_all_children() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let root = dir.path().join("source");
         for folder in ["A", "B", "C"] {
             std::fs::create_dir_all(root.join(folder)).unwrap();
@@ -2229,7 +2236,7 @@ mod tests {
 
     #[test]
     fn directory_metadata_retries_pending_contents() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let source = dir.path().join("source");
         let folder = source.join("folder");
         std::fs::create_dir_all(&folder).unwrap();
@@ -2268,7 +2275,7 @@ mod tests {
 
     #[test]
     fn directory_metadata_waits_for_the_child_rename_notification() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let source = dir.path().join("source");
         let parent = source.join("folder");
         std::fs::create_dir_all(&parent).unwrap();
@@ -2329,7 +2336,7 @@ mod tests {
 
     #[test]
     fn queued_metadata_does_not_delete_a_file_before_its_rename_notification() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let source = dir.path().join("source");
         std::fs::create_dir(&source).unwrap();
         let old = source.join("old.txt");
@@ -2386,7 +2393,7 @@ mod tests {
     #[test]
     fn queued_metadata_before_a_paired_rename_preserves_identity() {
         for stale_metadata in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = canonical_tempdir();
             let source = dir.path().join("source");
             std::fs::create_dir(&source).unwrap();
             let old = source.join("old.txt");
@@ -2437,7 +2444,7 @@ mod tests {
 
     #[test]
     fn creates_resizes_moves_unicode_subtrees_and_deletes_without_rewriting_base() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let source = dir.path().join("source");
         let output = dir.path().join("data");
         std::fs::create_dir(&source).unwrap();

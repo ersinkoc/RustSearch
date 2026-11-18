@@ -164,6 +164,24 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("separate", output)
         self.assertFalse(self.app.exists())
 
+    def test_relative_checksum_uses_powershell_location(self):
+        environment = dict(os.environ, RS_INSTALL_SCRIPT=str(ROOT / "install.ps1"),
+                           RS_INSTALL_APP=str(self.app), RS_INSTALL_DATA=str(self.data),
+                           RS_INSTALL_ARCHIVE=str(self.archive),
+                           RS_INSTALL_CHECKSUM=os.path.relpath(self.archive.parent / "SHA256SUMS.txt", ROOT))
+        command = (
+            "[Environment]::CurrentDirectory = $env:WINDIR; "
+            "& $env:RS_INSTALL_SCRIPT -InstallDirectory $env:RS_INSTALL_APP "
+            "-DataDirectory $env:RS_INSTALL_DATA -Archive $env:RS_INSTALL_ARCHIVE "
+            "-ChecksumFile $env:RS_INSTALL_CHECKSUM -NoIntegration -NoLaunch; "
+            "if (-not $?) { exit 1 }"
+        )
+        result = subprocess.run([SHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                 "-Command", command], cwd=ROOT, env=environment,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.app / "rustsearch.exe").exists())
+
     def test_worker_migrates_and_update_failure_rolls_back(self):
         self.profile["background"] = True
         self.profile_path.write_text(json.dumps(self.profile))

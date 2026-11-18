@@ -102,6 +102,10 @@ The installer suite uses isolated data and installation directories, including
 paths with spaces. It exercises upgrades, uninstall/data retention, downgrade
 rejection, corrupt downloads, internal checksum failures, ZIP traversal, unowned
 directories, real worker migration, and failed-activation rollback.
+It also verifies relative checksum paths when PowerShell's location differs
+from the process working directory. Synthetic live-update fixtures canonicalize
+the temporary-directory base, matching the engine's watch roots on accounts
+whose TEMP uses an 8.3 alias or junction.
 
 Package only committed sources with
 `python scripts/package-release.py --build 2 --output .temp_files/release-build2`.

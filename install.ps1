@@ -299,6 +299,7 @@ try {
         $Archive = (Resolve-Path -LiteralPath $Archive).Path
         if (-not $ChecksumFile) { $ChecksumFile = Join-Path ([IO.Path]::GetDirectoryName($Archive)) 'SHA256SUMS.txt' }
     }
+    $ChecksumFile = (Resolve-Path -LiteralPath $ChecksumFile).ProviderPath
     Verify-File $Archive $ChecksumFile ([IO.Path]::GetFileName($Archive))
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $payload = Join-Path $stage 'payload'
