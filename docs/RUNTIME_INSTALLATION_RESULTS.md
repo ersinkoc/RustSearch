@@ -28,7 +28,7 @@ During the first cooperative recovery runs, the native reader still reported rep
 
 ## Durable-log follow-up
 
-The extended real-drive check exposed another independent source of repeated rebuilding: every append reparsed the complete durable log under a newly acquired writer lock. The D: log reached **66,982,890 bytes**, only **125,974 bytes below its 64 MiB limit**, before the old worker was stopped. At that limit the engine's existing recovery path would request a fresh scan even without notification loss.
+The extended real-drive check exposed another independent source of repeated rebuilding: every append reparsed the complete durable log under a newly acquired writer lock. The D: log reached **66,982,890 bytes**, only **125,974 bytes below its 64 MiB limit**, before the old worker was stopped. A retained pre-fix diagnostic records **delta budget reached; compact to a new path**. The failed frame exceeded the remaining headroom, and that error path requests a full scan even without notification loss. The old worker was stopped before a replacement catalog was published. That diagnostic predates the current worker and remains as historical evidence; its timestamp has not advanced during the updated run.
 
 Managed sources now retain one writer guard across updates. The guard caches only validated sequence/checkpoint/position and file metadata, not the log contents. A new guard or changed log metadata forces full validation; stale writers, checksums, checkpoint chains, and incomplete-tail recovery remain checked. Other cooperating writers are excluded while the worker owns that source; readers remain supported.
 
@@ -49,7 +49,7 @@ Version remains **0.0.1**. The installed local desktop build contains source thr
 - `cargo test --workspace --release --locked`: **83 passed**, zero failed.
 - `cargo build --workspace --bins --release --locked`: passed.
 
-These checks cover backend/runtime behavior. GUI layout, accessibility, and visual acceptance were not repeated in this change. Existing [desktop limitations](DESKTOP.md) and the upstream dependency advisory still apply.
+These checks cover backend/runtime behavior. Warm-query throughput was not rebenchmarked in this runtime follow-up; query correctness was checked against the linear implementation and with real live searches. GUI layout, accessibility, and visual acceptance were not repeated in this change. Existing [desktop limitations](DESKTOP.md) and the upstream dependency advisory still apply.
 
 ## Same-disk startup and live results
 
@@ -82,13 +82,33 @@ The resize fixture wrote 4,097 bytes on each drive; indexed sizes correctly rema
 
 ## Background resource results
 
-The first larger-buffer sample ran for **61.41 seconds**, with 61 process samples, GUI closed, and no search requests. The worker was still **Checking saved files** throughout: **100.07% of one core / 3.13% of the 32-thread machine**, private commit **1718.1–1756.1 MiB**, resident working set **1713.3–1757.3 MiB**. This is active catch-up, not idle. One catalog remained in use.
+The first observed interval with no queued recovery across all sources was **64 minutes 30 seconds after launch**, when the worker reported **Monitoring changes**. This is an observation time rather than a continuously captured exact completion timestamp. This was one background offline-change check on the retained catalog, including ordinary live changes and one application queue burst coalesced into folder deltas. At that point the source contained **22,270,123 records**: C: **7,660,497**, D: **14,457,622**, E: **152,004**. Coverage remains partial: the saved sources report **958 skipped entries**, and **970 indexed rows** were pending refresh at that observation. Those categories can overlap.
 
-The final subtree-range build's active catch-up sample lasted **61.44 seconds**: **100.07% of one core / 3.13% of the machine**, private commit **1723.2–1775.3 MiB**, working set **1723.9–1776.4 MiB**. It also retained one catalog and never entered a full scan during the interval.
+**Offline-change traversal remains far too expensive on this corpus.** Cached searches stay available during it; this fix does not eliminate the one check after worker downtime. After it drained, subsequent live activity caused short directory-check batches. The current **Syncing / Checking saved files** label also describes these ordinary batches and can therefore appear again without a new full scan.
 
-At the 18 November 2026 08:55 local checkpoint (UTC+02:00), E: had completed its saved-file traversal; C:/D: had cumulatively checked about **194,000 / 202,000 directories**, with further descendants queued. The final worker reported **zero backend losses and zero queue recoveries**. True monitoring-only CPU/RAM was not yet measured at this checkpoint. The previous worker had three application queue recoveries during local builds, coalesced into folder work without kernel loss or catalog replacement.
+Two app-idle monitoring windows followed the first empty recovery interval. The GUI was closed, indexing remained enabled, and no search requests or fixture mutations were issued during either window. Ambient filesystem changes continued. Each window sampled the same process 61 times and retained one catalog. These are **app-idle background-monitoring measurements with active volumes**, not quiescent-disk idle measurements.
 
-The earlier [overflow report](OVERFLOW_RECOVERY_RESULTS.md) measured 66.82–85.33% of one core during monitoring with size collection enabled. That profile, corpus, and phase differ from this size-disabled recovery run, so no CPU/memory improvement is claimed from those numbers. Raw disk paths, endpoint credentials, row metadata, logs, hashes, and samples remain private; only aggregate evidence is published.
+CPU is process CPU-time change divided by elapsed time; whole-machine CPU divides again by the verified **32 logical processors**. Private commit and resident working set are separate Windows counters.
 
+| Window | Duration | CPU, one core = 100% | CPU, whole machine = 100% | Private commit | Resident working set |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before the final live round | 62.14 s | 66.08% | 2.07% | 1748.9–1788.2 MiB | 1537.3–1583.2 MiB |
+| After the final live round | 61.92 s | 69.35% | 2.17% | 1757.2–1788.2 MiB | 1545.4–1571.6 MiB |
 
-The subsequent durable-log fix and real-drive checks above supersede that earlier runtime checkpoint. The post-checkpoint worker retained the same catalog and all six base/cache hashes through another C:/D:/E: live mutation run. Monitoring-only resource measurements remain pending until its offline-change check finishes.
+The first window recorded 41 **Monitoring changes** and 20 **Checking saved files** samples; the second recorded 38 / 23. The initial offline check had already drained before both windows. Brief live folder reconciliation explains the mixed phases; neither window is represented as 61 uninterrupted monitoring samples.
+
+**The low-resource app-idle target remains unmet.** This change removes expensive repeated history validation and avoids rebuilding a source merely because redundant log history fills the budget. It does not establish negligible background CPU, a memory reduction, or superiority over Everything. Small-folder reconciliation and repeated search-overlay binding remain candidates for further profiling.
+
+For comparison, the larger-buffer build's earlier active catch-up window used **100.07% of one core / 3.13% of the machine**, private commit **1718.1–1756.1 MiB**, and working set **1713.3–1757.3 MiB** over **61.41 seconds**. A later pre-checkpoint subtree-range window used **100.07% / 3.13%**, private commit **1723.2–1775.3 MiB**, and working set **1723.9–1776.4 MiB** over **61.44 seconds**. The checkpoint build's active catch-up window used **97.28% / 3.04%**, private commit **1754.6–1873.9 MiB**, and working set **1163.1–1217.6 MiB** over **61.94 seconds**. These differ in phase and cache/residency conditions; no controlled CPU or memory speedup is inferred from them.
+
+The earlier [overflow report](OVERFLOW_RECOVERY_RESULTS.md) measured 66.82–85.33% of one core during monitoring with size collection enabled. That profile and corpus differ from this size-disabled run, so it is not an equivalent idle baseline.
+
+## Final runtime verification
+
+The post-catch-up C:/D:/E: mutation round passed combined and per-drive searches, creation (**1.043 s**), file rename with retained IDs, Unicode folder moves with retained descendant IDs (**0.879 s**), and deletion (**1.017 s**). Size fields remained unknown by configuration. All **six snapshot/cache SHA-256 values** and the catalog stayed unchanged. Owned fixture files and directories were removed.
+
+The running worker recorded **one application queue recovery and zero backend losses** through these checks. C: also automatically folded another accumulated-history interval during the run: its log fell from about **48.4 MB to 22.0 MB**, advanced its checkpoint starting sequence from **9,753 to 13,399**, and retained all six base/cache hashes. No full source replacement was observed.
+
+The local portable package's **987 checksum entries** were verified. One updated portable worker remains enabled for the normal data directory and Windows sign-in startup; the unused development profile remains disabled. Public **v0.0.1** tag/archive bytes are unchanged. GUI layout and visual acceptance were not rerun for this backend change.
+
+Raw disk paths, endpoint credentials, row metadata, logs, hashes, and process samples stay private. Only aggregate evidence is published here.
