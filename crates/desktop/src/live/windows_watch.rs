@@ -13,10 +13,31 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Storage::FileSystem::*,
-    System::{IO::*, Threading::*},
+    System::{
+        IO::*,
+        Threading::*,
+        WindowsProgramming::{DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE, DRIVE_UNKNOWN},
+    },
 };
 
-const BUFFER_BYTES: usize = 64 * 1024;
+const NETWORK_BUFFER_BYTES: usize = 64 * 1024;
+const LOCAL_BUFFER_BYTES: usize = 1024 * 1024;
+fn buffer_bytes(root: &Path) -> usize {
+    let path: Vec<_> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut volume = vec![0u16; 32768];
+    // SAFETY: terminated input and writable output with the declared capacity.
+    let kind = unsafe {
+        if GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) == 0 {
+            DRIVE_UNKNOWN
+        } else {
+            GetDriveTypeW(volume.as_ptr())
+        }
+    };
+    match kind {
+        DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_RAMDISK => LOCAL_BUFFER_BYTES,
+        _ => NETWORK_BUFFER_BYTES,
+    }
+}
 struct Handle(HANDLE);
 // SAFETY: owned kernel handles can be transferred between threads; event operations are
 // thread-safe. Directory I/O handles are used exclusively by their reader thread.
@@ -70,10 +91,19 @@ impl NativeWatch {
         let stop = Arc::new(event_handle()?);
         let complete = event_handle()?;
         let stopping = stop.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("rustsearch-notify".into())
-            .spawn(move || run(root, directory, stopping, complete, receive))
+            .spawn(move || run(root, directory, stopping, complete, receive, ready_tx))
             .context("start native notification reader")?;
+        let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
+        if !matches!(&ready, Ok(Ok(()))) {
+            unsafe {
+                SetEvent(stop.0);
+            }
+            let _ = thread.join();
+            anyhow::bail!("start directory notifications: {ready:?}");
+        }
         Ok(Self {
             stop,
             thread: Some(thread),
@@ -151,12 +181,12 @@ fn issue(
     // completion/cancellation. Only one request is outstanding on this directory handle.
     unsafe {
         ResetEvent(complete.0);
+        // Only implemented index fields: timestamp/content writes of unchanged size
+        // otherwise swamp full-volume watchers without changing any searchable value.
         let flags = FILE_NOTIFY_CHANGE_FILE_NAME
             | FILE_NOTIFY_CHANGE_DIR_NAME
             | FILE_NOTIFY_CHANGE_ATTRIBUTES
             | FILE_NOTIFY_CHANGE_SIZE
-            | FILE_NOTIFY_CHANGE_LAST_WRITE
-            | FILE_NOTIFY_CHANGE_CREATION
             | FILE_NOTIFY_CHANGE_SECURITY;
         ReadDirectoryChangesW(
             directory.0,
@@ -213,16 +243,29 @@ impl Drop for Reader {
         }
     }
 }
-fn run(root: PathBuf, directory: Handle, stop: Arc<Handle>, complete: Handle, receive: Receiver) {
+fn run(
+    root: PathBuf,
+    directory: Handle,
+    stop: Arc<Handle>,
+    complete: Handle,
+    receive: Receiver,
+    ready: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+) {
+    let buffer_bytes = buffer_bytes(&root);
     let mut reader = Reader {
         directory,
         complete,
-        receiving: vec![0; BUFFER_BYTES],
-        completed: vec![0; BUFFER_BYTES],
+        receiving: vec![0; buffer_bytes],
+        completed: vec![0; buffer_bytes],
         overlap: Box::new(unsafe { core::mem::zeroed() }),
         pending: false,
     };
     reader.arm();
+    let _ = ready.send(if reader.pending {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    });
     let mut announced_failure = false;
     loop {
         if !reader.pending {
@@ -277,6 +320,56 @@ fn run(root: PathBuf, directory: Handle, stop: Arc<Handle>, complete: Handle, re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_reader_is_armed_on_return_and_tracks_flushed_size_and_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("before.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(buffer_bytes(dir.path()), LOCAL_BUFFER_BYTES);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _watch = NativeWatch::new(
+            dir.path().to_owned(),
+            Arc::new(move |events| {
+                for event in events {
+                    let _ = tx.send(event);
+                }
+            }),
+        )
+        .unwrap();
+        let handle = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        handle.set_len(4097).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = rx
+                .recv_timeout(end.saturating_duration_since(std::time::Instant::now()))
+                .expect("size notification missing");
+            if event.paths == [file.clone()] && matches!(event.kind, EventKind::Modify(_)) {
+                break;
+            }
+        }
+        let renamed = dir.path().join("after.txt");
+        std::fs::rename(&file, &renamed).unwrap();
+        let mut old = false;
+        let mut new = false;
+        while !old || !new {
+            let event = rx
+                .recv_timeout(end.saturating_duration_since(std::time::Instant::now()))
+                .expect("rename notification missing");
+            old |= event.paths == [file.clone()]
+                && matches!(
+                    event.kind,
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From))
+                );
+            new |= event.paths == [renamed.clone()]
+                && matches!(
+                    event.kind,
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                );
+        }
+    }
+
     #[test]
     fn idle_readers_cancel_without_waiting_for_another_filesystem_event() {
         let dir = tempfile::tempdir().unwrap();
